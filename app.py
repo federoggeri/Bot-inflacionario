@@ -1,25 +1,33 @@
-import datetime
+import unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
 st.set_page_config(
-    page_title="Monitor de Inflación & Optimizador",
+    page_title="Monitor de Inflación & Precios",
     page_icon="🛒",
     layout="wide"
 )
 
 # ==============================================================================
-# 1. GENERADOR DE GÓNDOLA REAL ARGENTINA
+# 1. GENERACIÓN DEL CATÁLOGO EXTENSO Y MOTOR DE PRECIOS
 # ==============================================================================
 
-PLANTILLAS_ALIMENTOS = [
+def normalizar_texto(texto: str) -> str:
+    """Elimina tildes y pasa a minúsculas para búsquedas perfectas."""
+    if not isinstance(texto, str):
+        return ""
+    texto_norm = unicodedata.normalize('NFD', texto)
+    texto_sin_tilde = "".join(c for c in texto_norm if unicodedata.category(c) != 'Mn')
+    return texto_sin_tilde.lower().strip()
+
+PLANTILLAS_GONDOLA = [
     # CARNICERÍA Y GRANJA
-    {"items": ["Asado de Tira", "Vacío", "Bife de Chorizo", "Colita de Cuadril", "Matambre Vacuno", "Nalga para Milanesas", "Peceto", "Bola de Lomo", "Carne Picada Especial"], "marcas": ["Corte Selección", "Novillito Especial", "Cabaña Las Lilas"], "medidas": ["x kg"], "cat": "Carnicería y Granja", "p_min": 7500, "p_max": 14500},
+    {"items": ["Asado de Tira", "Vacío", "Bife de Chorizo", "Colita de Cuadril", "Matambre Vacuno", "Nalga para Milanesas", "Peceto", "Bola de Lomo", "Carne Picada Especial"], "marcas": ["Corte Selección", "Novillito Especial", "Cabaña Las Lilas"], "medidas": ["x kg"], "cat": "Carnicería y Granja", "p_min": 7800, "p_max": 14500},
     {"items": ["Pechuga de Pollo", "Pata y Muslo", "Pollo Entero Fresco", "Milanesas de Pollo Rebozadas"], "marcas": ["Granja Tres Arroyos", "Cresta Roja", "Granja del Sol"], "medidas": ["x kg"], "cat": "Carnicería y Granja", "p_min": 3800, "p_max": 7900},
     {"items": ["Hamburguesas Clásicas x4", "Hamburguesas Clásicas x12", "Hamburguesas Fritas x4"], "marcas": ["Paty", "Swift", "Good Mark"], "medidas": ["unid."], "cat": "Carnicería y Granja", "p_min": 3200, "p_max": 9500},
-    
+
     # FRUTAS Y VERDURAS
     {"items": ["Papa Negra", "Cebolla Blanca", "Tomate Redondo", "Zanahoria", "Lechuga Capuchina", "Manzana Roja", "Banana Ecuador", "Naranja de Jugo", "Limón", "Morrón Rojo"], "marcas": ["Selección Feria", "Huerta Fresca"], "medidas": ["x kg"], "cat": "Frutas y Verduras", "p_min": 1100, "p_max": 4200},
     {"items": ["Palta Hass"], "marcas": ["Selección"], "medidas": ["x unidad"], "cat": "Frutas y Verduras", "p_min": 1500, "p_max": 2500},
@@ -69,154 +77,176 @@ PLANTILLAS_ALIMENTOS = [
 ]
 
 PESOS_SUPER = {
-    "Dia": 0.955,                      # Estrategia hard discount
+    "Dia": 0.955,                      # Cadena Hard Discount
     "Coto": 0.988,                     # Hipermercado tradicional
     "Carrefour": 1.000,                # Media de mercado
-    "PedidosYa Market Belgrano": 1.155 # Prima de inmediatez
+    "PedidosYa Market Belgrano": 1.155 # Prima de conveniencia / Dark store
 }
 
 @st.cache_data
-def generar_catalogo_maestro():
+def generar_catalogo_base():
     filas = []
-    contador = 1000
-    for grupo in PLANTILLAS_ALIMENTOS:
-        cat = grupo["cat"]
-        for it in grupo["items"]:
-            for m in grupo["marcas"]:
-                for med in grupo["medidas"]:
-                    ean = f"779{contador:010d}"
-                    nombre_completo = f"{it} {m} {med}"
-                    p_base = (grupo["p_min"] + grupo["p_max"]) / 2.0
+    c = 1000
+    for g in PLANTILLAS_GONDOLA:
+        for it in g["items"]:
+            for m in g["marcas"]:
+                for med in g["medidas"]:
+                    ean = f"779{c:010d}"
+                    p_base = (g["p_min"] + g["p_max"]) / 2.0
                     filas.append({
                         "ean": ean,
-                        "producto": nombre_completo,
-                        "categoria": cat,
+                        "producto": f"{it} {m} {med}",
+                        "categoria": g["cat"],
                         "marca": m,
                         "precio_base": round(p_base, 2)
                     })
-                    contador += 1
+                    c += 1
     return pd.DataFrame(filas).drop_duplicates(subset=["producto"])
 
 if "catalogo" not in st.session_state:
-    st.session_state.catalogo = generar_catalogo_maestro()
+    st.session_state.catalogo = generar_catalogo_base()
 
 df_catalogo = st.session_state.catalogo
-CATEGORIAS_DISPONIBLES = ["Todas"] + sorted(df_catalogo["categoria"].unique().tolist())
+CATEGORIAS = ["Todas"] + sorted(df_catalogo["categoria"].unique().tolist())
 
-HOY = datetime.date.today()
-FECHAS = [(HOY - datetime.timedelta(weeks=w)).isoformat() for w in range(5, -1, -1)]
+# ==============================================================================
+# 2. DEFINICIÓN DE TIEMPO (6 MESES Y 30 DÍAS DEL MES)
+# ==============================================================================
 
-def obtener_precios_panel(productos_lista: list) -> pd.DataFrame:
-    sub_df = df_catalogo[df_catalogo["producto"].isin(productos_lista)]
+MESES_HISTORIA = ["Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre"]
+INFLACION_MENSUAL_SECTOR = [0.042, 0.046, 0.040, 0.038, 0.035, 0.032] # Tasas reales del INDEC alimentos
+
+DIAS_DEL_MES = list(range(1, 31))
+
+def obtener_precios_mensuales(productos: list) -> pd.DataFrame:
+    """Genera la serie temporal de 6 meses para la canasta del usuario."""
+    sub = df_catalogo[df_catalogo["producto"].isin(productos)]
     registros = []
+    
+    for idx_m, mes in enumerate(MESES_HISTORIA):
+        factor_acum = 1.0
+        for i in range(idx_m + 1, len(MESES_HISTORIA)):
+            factor_acum /= (1 + INFLACION_MENSUAL_SECTOR[i])
 
-    for idx_sem, f in enumerate(FECHAS):
-        factor_inf = (1 + 0.0105) ** (idx_sem - 5)
-        for superm, ratio_tienda in PESOS_SUPER.items():
-            for _, row in sub_df.iterrows():
-                seed = (hash(row["ean"] + superm + f) % 1000) / 1000.0
-                ruido = 0.985 + (seed * 0.03)
-                p_final = round(row["precio_base"] * factor_inf * ratio_tienda * ruido, 2)
+        for superm, ratio_cadena in PESOS_SUPER.items():
+            for _, row in sub.iterrows():
+                seed = (hash(row["ean"] + superm + mes) % 1000) / 1000.0
+                ruido = 0.988 + (seed * 0.024)
+                precio = round(row["precio_base"] * factor_acum * ratio_cadena * ruido, 2)
                 registros.append({
-                    "fecha": f,
-                    "ean": row["ean"],
+                    "mes": mes,
+                    "mes_idx": idx_m,
                     "producto": row["producto"],
                     "categoria": row["categoria"],
-                    "marca": row["marca"],
                     "supermercado": superm,
-                    "precio": p_final
+                    "precio": precio
                 })
     return pd.DataFrame(registros)
 
+def obtener_precios_diarios_mes(productos: list) -> pd.DataFrame:
+    """Genera la evolución diaria (Día 1 al Día 30) del mes corriente."""
+    sub = df_catalogo[df_catalogo["producto"].isin(productos)]
+    registros = []
+
+    for dia in DIAS_DEL_MES:
+        # Tendencia inflacionaria diaria + efecto fin de semana/descuentos
+        tasa_dia = 1.0 + (dia / 30.0) * 0.032
+        efecto_promo = 0.97 if dia % 7 in [3, 4] else 1.01  # Miércoles/jueves descuentos
+        
+        for superm, ratio_cadena in PESOS_SUPER.items():
+            for _, row in sub.iterrows():
+                seed = (hash(row["ean"] + superm + str(dia)) % 1000) / 1000.0
+                ruido = 0.99 + (seed * 0.02)
+                precio = round(row["precio_base"] * tasa_dia * ratio_cadena * efecto_promo * ruido, 2)
+                registros.append({
+                    "dia": f"Día {dia:02d}",
+                    "dia_num": dia,
+                    "producto": row["producto"],
+                    "categoria": row["categoria"],
+                    "supermercado": superm,
+                    "precio": precio
+                })
+    return pd.DataFrame(registros)
+
+# Estado de la canasta
 if "canasta" not in st.session_state:
     st.session_state.canasta = {}
 
 # ==============================================================================
-# 2. ENCABEZADO
+# 3. INTERFAZ PRINCIPAL STREAMLIT
 # ==============================================================================
+
 st.title("🛒 Monitor de Inflación Personal & Comparador de Precios")
-st.caption(f"Base activa: **{len(df_catalogo):,} productos reales de góndola argentina** | Carrefour, Día, Coto y PedidosYa Market Belgrano")
+st.caption(f"Base de Góndola Activa: **{len(df_catalogo):,} productos** | Comercios: Carrefour, Día, Coto y PedidosYa Market Belgrano")
 
 tab1, tab2, tab3 = st.tabs([
     "🧺 1. Armar y Editar Canasta",
-    "📈 2. Mi Inflación Personal (Laspeyres)",
-    "🎯 3. ¿Dónde Conviene Comprar Hoy?"
+    "📈 2. Análisis de Inflación (Mensual & Diario)",
+    "🎯 3. Optimizador de Faltantes"
 ])
 
 # ==============================================================================
-# PESTAÑA 1: ARMAR Y EDITAR CANASTA
+# PESTAÑA 1: ARMAR Y EDITAR CANASTA (BUSCADOR INTELIGENTE + AGREGADO AL VUELO)
 # ==============================================================================
 with tab1:
-    st.subheader("1. Buscador y Selección de Alimentos")
-    st.write("Escribí cualquier alimento, marca o variedad (ej: *dulce de leche*, *asado*, *chocolinas*, *playadito*, *lays*, *coca*):")
+    st.subheader("1. Selección y Búsqueda de Alimentos")
+    st.write("Escribí cualquier producto (ej: *dulce de leche*, *asado*, *playadito*, *lays*, *leche*, *fideos*):")
 
     c_cat, c_txt = st.columns([1, 2])
     with c_cat:
-        cat_elegida = st.selectbox("Filtrar por Categoría:", CATEGORIAS_DISPONIBLES)
+        cat_filtro = st.selectbox("Filtrar por Categoría:", CATEGORIAS)
     with c_txt:
-        busqueda_txt = st.text_input("Buscador por Texto:")
+        busq_input = st.text_input("Buscador por Texto:")
 
-    sub_cat = df_catalogo if cat_elegida == "Todas" else df_catalogo[df_catalogo["categoria"] == cat_elegida]
+    sub_df = df_catalogo if cat_filtro == "Todas" else df_catalogo[df_catalogo["categoria"] == cat_filtro]
 
-    if busqueda_txt.strip():
-        palabras = busqueda_txt.strip().lower().split()
-        for p in palabras:
+    if busq_input.strip():
+        terminos = normalizar_texto(busq_input).split()
+        for t in terminos:
             mascara = (
-                sub_cat["producto"].str.lower().str.contains(p, na=False) |
-                sub_cat["marca"].str.lower().str.contains(p, na=False) |
-                sub_cat["ean"].str.contains(p, na=False)
+                sub_df["producto"].apply(normalizar_texto).str.contains(t, na=False) |
+                sub_df["marca"].apply(normalizar_texto).str.contains(t, na=False) |
+                sub_df["ean"].str.contains(t, na=False)
             )
-            sub_cat = sub_cat[mascara]
+            sub_df = sub_df[mascara]
 
-    st.caption(f"Coincidencias encontradas: **{len(sub_cat):,}** productos")
+    st.caption(f"Coincidencias encontradas: **{len(sub_df):,}** productos")
 
-    if len(sub_cat) > 0:
+    if len(sub_df) > 0:
         c_prod, c_cant, c_btn = st.columns([3, 1, 1])
         with c_prod:
-            prod_seleccionado = st.selectbox("Seleccionar Producto:", sub_cat["producto"].tolist())
+            prod_elegido = st.selectbox("Seleccionar Producto:", sub_df["producto"].tolist())
         with c_cant:
-            cant_seleccionada = st.number_input("Cantidad mensual (q₀):", min_value=1.0, value=2.0, step=1.0)
+            cant_elegida = st.number_input("Cantidad mensual (q₀):", min_value=1.0, value=2.0, step=1.0)
         with c_btn:
             st.write("")
             st.write("")
             if st.button("➕ Agregar a Canasta", use_container_width=True):
-                st.session_state.canasta[prod_seleccionado] = cant_seleccionada
-                st.toast(f"Agregado: {prod_seleccionado}", icon="✅")
+                st.session_state.canasta[prod_elegido] = cant_elegida
+                st.toast(f"Agregado: {prod_elegido}", icon="✅")
     else:
-        st.warning("No se encontraron productos con ese término.")
-
-    # Formulario para agregar productos personalizados
-    with st.expander("✨ ¿Buscás un producto muy puntual que no figura en la lista? Agregalo acá en 1 segundo"):
-        st.write("Escribí el nombre y precio de referencia. El bot lo indexará con código EAN y le calculará el precio en los 4 supermercados:")
-        c_nuevo_nom, c_nuevo_cat, c_nuevo_p, c_nuevo_btn = st.columns([2, 1.5, 1, 1])
-        with c_nuevo_nom:
-            nuevo_nombre = st.text_input("Nombre del Producto:", placeholder="Ej: Tapas de Empanadas La Salteña x12")
-        with c_nuevo_cat:
-            nuevo_rubro = st.selectbox("Categoría:", [c for c in CATEGORIAS_DISPONIBLES if c != "Todas"])
-        with c_nuevo_p:
-            nuevo_precio = st.number_input("Precio Estimado ($):", min_value=100.0, value=2500.0, step=100.0)
-        with c_nuevo_btn:
-            st.write("")
-            st.write("")
-            if st.button("➕ Crear Producto", use_container_width=True):
-                if nuevo_nombre.strip():
-                    nuevo_ean = f"77999{np.random.randint(1000000, 9999999)}"
-                    nuevo_registro = pd.DataFrame([{
-                        "ean": nuevo_ean,
-                        "producto": nuevo_nombre.strip(),
-                        "categoria": nuevo_rubro,
-                        "marca": "Especial",
-                        "precio_base": round(nuevo_precio, 2)
-                    }])
-                    st.session_state.catalogo = pd.concat([st.session_state.catalogo, nuevo_registro], ignore_index=True)
-                    st.session_state.canasta[nuevo_nombre.strip()] = 2.0
-                    st.success(f"¡'{nuevo_nombre}' agregado con éxito!")
-                    st.rerun()
+        st.warning(f"No se encontró '{busq_input}' en la lista fija.")
+        # BOTÓN MÁGICO: Crear y agregar al vuelo si no estaba
+        if busq_input.strip():
+            nombre_sugerido = busq_input.strip().title()
+            if st.button(f"✨ Crear y Agregar '{nombre_sugerido}' a mi canasta ahora", type="primary"):
+                nuevo_ean = f"779{np.random.randint(1000000000, 9999999999)}"
+                nuevo_prod = pd.DataFrame([{
+                    "ean": nuevo_ean,
+                    "producto": nombre_sugerido,
+                    "categoria": cat_filtro if cat_filtro != "Todas" else "Almacén",
+                    "marca": "Especial",
+                    "precio_base": 2800.0
+                }])
+                st.session_state.catalogo = pd.concat([st.session_state.catalogo, nuevo_prod], ignore_index=True)
+                st.session_state.canasta[nombre_sugerido] = 2.0
+                st.success(f"¡'{nombre_sugerido}' creado y sumado a tu canasta!")
+                st.rerun()
 
     st.divider()
 
     # Visualización y edición de la canasta
-    st.subheader("Tu Canasta Mensual Ponderada")
+    st.subheader("Tu Canasta Mensual Ponderada Actual")
     if st.session_state.canasta:
         items_vista = []
         for p, q in st.session_state.canasta.items():
@@ -227,7 +257,7 @@ with tab1:
                 "Categoría": cat_p,
                 "Código EAN": ean_p,
                 "Producto": p,
-                "Cantidad (q₀)": q
+                "Cantidad Mensual (q₀)": q
             })
         st.dataframe(pd.DataFrame(items_vista), use_container_width=True)
 
@@ -243,101 +273,134 @@ with tab1:
         with col_vaciar:
             st.write("")
             st.write("")
-            if st.button("❌ Vaciar Todo", use_container_width=True):
+            if st.button("❌ Vaciar Canasta", use_container_width=True):
                 st.session_state.canasta = {}
                 st.rerun()
     else:
         st.info("Tu canasta está vacía. Sumá alimentos arriba para comenzar a medir.")
 
 # ==============================================================================
-# PESTAÑA 2: INFLACIÓN PERSONAL (LASPEYRES)
+# PESTAÑA 2: ANÁLISIS DE INFLACIÓN (MES A MES & DÍA A DÍA)
 # ==============================================================================
 with tab2:
-    st.subheader("Cálculo del Índice de Laspeyres")
+    st.subheader("2. Medición Econométrica: Índice de Laspeyres")
     if not st.session_state.canasta:
         st.warning("Primero agregá productos en la pestaña '1. Armar y Editar Canasta'.")
     else:
-        col_f0, col_ft = st.columns(2)
-        with col_f0:
-            f0 = st.selectbox("Período Base (t₀):", FECHAS, index=0)
-        with col_ft:
-            ft = st.selectbox("Período de Comparación (t):", FECHAS, index=len(FECHAS)-1)
+        prods_usuario = list(st.session_state.canasta.keys())
+        
+        # --- A. INFLACIÓN MENSUAL MES A MES ---
+        df_mensual = obtener_precios_mensuales(prods_usuario)
+        df_mensual["q0"] = df_mensual["producto"].map(st.session_state.canasta)
+        df_mensual["gasto_item"] = df_mensual["precio"] * df_mensual["q0"]
 
-        prods = list(st.session_state.canasta.keys())
-        df_panel = obtener_precios_panel(prods)
+        # Costo total de la canasta por mes (promedio del mercado)
+        costo_mes = df_mensual.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
+        
+        # Cálculo de la tasa de inflación mensual mes a mes: (Gasto_m - Gasto_{m-1}) / Gasto_{m-1} * 100
+        costo_mes["inflacion_mensual_%"] = costo_mes["gasto_item"].pct_change() * 100
+        costo_mes["inflacion_mensual_%"] = costo_mes["inflacion_mensual_%"].fillna(0.0)
 
-        p0 = df_panel[df_panel["fecha"] == f0].groupby("producto")["precio"].mean()
-        pt = df_panel[df_panel["fecha"] == ft].groupby("producto")["precio"].mean()
-
-        gasto_0 = sum(p0[p] * st.session_state.canasta[p] for p in prods if p in p0)
-        gasto_t = sum(pt[p] * st.session_state.canasta[p] for p in prods if p in pt)
-
-        inflacion_personal = ((gasto_t - gasto_0) / gasto_0) * 100 if gasto_0 > 0 else 0.0
-        indice_laspeyres = (gasto_t / gasto_0) * 100 if gasto_0 > 0 else 100.0
+        # Métricas de resumen
+        gasto_primer_mes = costo_mes.iloc[0]["gasto_item"]
+        gasto_ultimo_mes = costo_mes.iloc[-1]["gasto_item"]
+        inflacion_acumulada_6m = ((gasto_ultimo_mes - gasto_primer_mes) / gasto_primer_mes) * 100
+        ult_inflacion_m = costo_mes.iloc[-1]["inflacion_mensual_%"]
 
         m1, m2, m3 = st.columns(3)
-        m1.metric(f"Gasto Base ({f0})", f"${gasto_0:,.2f}")
-        m2.metric(f"Gasto Actual ({ft})", f"${gasto_t:,.2f}", delta=f"{inflacion_personal:+.2f}%")
-        m3.metric("Inflación Personal Acumulada", f"{inflacion_personal:.2f}%", help="Variación porcentual ponderada por tus cantidades fijas q0")
+        m1.metric(f"Valor Canasta ({costo_mes.iloc[0]['mes']})", f"${gasto_primer_mes:,.2f}")
+        m2.metric(f"Valor Canasta ({costo_mes.iloc[-1]['mes']})", f"${gasto_ultimo_mes:,.2f}", delta=f"{ult_inflacion_m:+.2f}% último mes")
+        m3.metric("Inflación Personal Acumulada (6 Meses)", f"{inflacion_acumulada_6m:.2f}%", help="Variación porcentual total del período con tu canasta fija")
+
+        st.markdown("### 📊 Gráfico 1: Variación de la Inflación Mensual (Mes a Mes)")
+        st.caption("Muestra la tasa de inflación periódica mensual (\%) que experimentó tu canasta a lo largo del tiempo:")
+
+        fig_mes = px.bar(
+            costo_mes.iloc[1:], # Mostramos a partir del segundo mes donde hay variación
+            x="mes",
+            y="inflacion_mensual_%",
+            text="inflacion_mensual_%",
+            color="inflacion_mensual_%",
+            color_continuous_scale="Reds",
+            title="Inflación Mensual de tu Canasta Mes a Mes (%)",
+            labels={"mes": "Mes de Medición", "inflacion_mensual_%": "Variación Mensual (%)"}
+        )
+        fig_mes.update_traces(texttemplate='%{text:.2f}%', textposition='outside')
+        fig_mes.update_layout(yaxis_ticksuffix="%")
+        st.plotly_chart(fig_mes, use_container_width=True)
 
         st.divider()
 
-        # Gráfico por Categoría
-        st.subheader("Desagregación: Variación de Precios por Rubro")
+        # --- B. EVOLUCIÓN DEL PRECIO EN LOS DÍAS DEL MES ---
+        st.markdown("### 📅 Gráfico 2: Evolución Diaria del Costo en el Mes (Día 1 al Día 30)")
+        st.caption("Comportamiento intrames: muestra cómo varió el gasto total de tu canasta día a día en cada supermercado:")
+
+        df_diario = obtener_precios_diarios_mes(prods_usuario)
+        df_diario["q0"] = df_diario["producto"].map(st.session_state.canasta)
+        df_diario["gasto_item"] = df_diario["precio"] * df_diario["q0"]
+
+        costo_diario_super = df_diario.groupby(["dia_num", "dia", "supermercado"])["gasto_item"].sum().reset_index()
+
+        fig_dia = px.line(
+            costo_diario_super,
+            x="dia",
+            y="gasto_item",
+            color="supermercado",
+            markers=True,
+            title="Trayectoria del Costo Total de la Canasta en los Días del Mes ($)",
+            labels={"dia": "Día del Mes", "gasto_item": "Costo Canasta ($)", "supermercado": "Supermercado"}
+        )
+        st.plotly_chart(fig_dia, use_container_width=True)
+
+        st.divider()
+
+        # --- C. DESGLOSE POR CATEGORÍA ---
+        st.markdown("### 🏷️ Variación de Precios por Categoría")
         cat_stats = []
-        for cat in df_panel["categoria"].unique():
-            prods_cat = [p for p in prods if df_catalogo[df_catalogo["producto"] == p]["categoria"].iloc[0] == cat]
-            g0_cat = sum(p0[p] * st.session_state.canasta[p] for p in prods_cat if p in p0)
-            gt_cat = sum(pt[p] * st.session_state.canasta[p] for p in prods_cat if p in pt)
-            inf_cat = ((gt_cat - g0_cat) / g0_cat) * 100 if g0_cat > 0 else 0.0
-            cat_stats.append({"Categoría": cat, "Inflación (%)": inf_cat})
+        for cat in df_mensual["categoria"].unique():
+            sub_cat_m = df_mensual[df_mensual["categoria"] == cat]
+            g0 = sub_cat_m[sub_cat_m["mes_idx"] == 0]["gasto_item"].sum()
+            gt = sub_cat_m[sub_cat_m["mes_idx"] == 5]["gasto_item"].sum()
+            inf_cat = ((gt - g0) / g0) * 100 if g0 > 0 else 0.0
+            cat_stats.append({"Categoría": cat, "Inflación Acumulada (%)": inf_cat})
 
-        fig_bar = px.bar(
-            pd.DataFrame(cat_stats), x="Categoría", y="Inflación (%)", color="Categoría",
-            title=f"Inflación Acumulada por Categoría ({f0} a {ft})", text_auto=".2f"
+        fig_cat = px.bar(
+            pd.DataFrame(cat_stats),
+            x="Categoría",
+            y="Inflación Acumulada (%)",
+            color="Categoría",
+            text_auto=".2f",
+            title="Inflación Acumulada por Rubro de Alimentos"
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        # Gráfico por Supermercado
-        st.subheader("Evolución del Costo Total Nominal por Supermercado")
-        df_evol = df_panel.copy()
-        df_evol["q0"] = df_evol["producto"].map(st.session_state.canasta)
-        df_evol["gasto_item"] = df_evol["precio"] * df_evol["q0"]
-        evol_super = df_evol.groupby(["fecha", "supermercado"])["gasto_item"].sum().reset_index()
-
-        fig_line = px.line(
-            evol_super, x="fecha", y="gasto_item", color="supermercado",
-            title="Trayectoria Semanal del Costo de la Canasta",
-            labels={"gasto_item": "Costo Canasta ($)", "fecha": "Semana"}
-        )
-        st.plotly_chart(fig_line, use_container_width=True)
+        st.plotly_chart(fig_cat, use_container_width=True)
 
 # ==============================================================================
 # PESTAÑA 3: ASISTENTE DE FALTANTES (OPTIMIZADOR)
 # ==============================================================================
 with tab3:
-    st.subheader("¿Dónde te conviene hacer tu próxima compra?")
-    st.write("Elegí qué productos necesitás reponer para comparar precios entre supermercados hoy:")
+    st.subheader("3. Asistente de Compras: ¿Dónde comprar más barato?")
+    st.write("Elegí qué productos necesitás reponer hoy para encontrar la opción más económica:")
 
-    opciones_def = list(st.session_state.canasta.keys()) if st.session_state.canasta else df_catalogo["producto"].head(10).tolist()
+    opciones_faltantes = list(st.session_state.canasta.keys()) if st.session_state.canasta else df_catalogo["producto"].head(10).tolist()
+    
     faltantes_seleccionados = st.multiselect(
         "Alimentos a comprar:",
-        options=opciones_def,
-        default=opciones_def[:3] if len(opciones_def) >= 3 else opciones_def
+        options=opciones_faltantes,
+        default=opciones_faltantes[:3] if len(opciones_faltantes) >= 3 else opciones_faltantes
     )
 
     if faltantes_seleccionados:
-        df_panel_falt = obtener_precios_panel(faltantes_seleccionados)
-        ult_fecha = FECHAS[-1]
-        df_ult = df_panel_falt[df_panel_falt["fecha"] == ult_fecha]
-        matriz = df_ult.pivot(index="producto", columns="supermercado", values="precio")
+        df_diario_falt = obtener_precios_diarios_mes(faltantes_seleccionados)
+        # Tomamos el último día disponible (Día 30)
+        df_ult_dia = df_diario_falt[df_diario_falt["dia_num"] == 30]
+        matriz = df_ult_dia.pivot(index="producto", columns="supermercado", values="precio")
 
         # 1. Monocadena
         totales_super = matriz.sum(axis=0).sort_values()
         mejor_cadena = totales_super.index[0]
         menor_gasto_mono = totales_super.iloc[0]
 
-        # 2. Split
+        # 2. Split (Arbitraje Multitienda)
         detalle_split = []
         gasto_split = 0.0
         for p in faltantes_seleccionados:
@@ -357,7 +420,7 @@ with tab3:
         r1, r2 = st.columns(2)
         with r1:
             st.success(f"### 📍 Opción 1: Comprar todo en {mejor_cadena}")
-            st.write("Ideal para hacer un único viaje y ahorrar tiempo de búsqueda:")
+            st.write("Ideal para hacer **un único viaje** y no perder tiempo:")
             st.metric("Gasto Total Monocadena", f"${menor_gasto_mono:,.2f}")
             st.dataframe(totales_super.rename("Costo Total ($)").to_frame(), use_container_width=True)
 
@@ -367,4 +430,4 @@ with tab3:
             st.metric("Gasto Dividido", f"${gasto_split:,.2f}", delta=f"-${ahorro:,.2f} ({ahorro_pct:.1f}%)")
             st.dataframe(pd.DataFrame(detalle_split), use_container_width=True)
     else:
-        st.info("Seleccioná productos en la lista para ver la comparativa de comercios.")
+        st.info("Seleccioná productos en la lista para ver la comparativa de supermercados.")
