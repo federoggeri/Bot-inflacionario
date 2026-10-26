@@ -25,25 +25,7 @@ st.set_page_config(
 TIENDAS = list(scraper.ADAPTADORES)
 
 # ==============================================================================
-# 0. SCHEDULER EN SEGUNDO PLANO (Snapshot automático cada 7 días)
-# ==============================================================================
-@st.cache_resource
-def iniciar_scheduler():
-    def loop():
-        while True:
-            try:
-                scraper.tomar_snapshot()  # Se saltea tiendas con menos de 7 días
-            except Exception:
-                pass
-            time.sleep(6 * 3600)          # Revisa cada 6 horas
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-    return t
-
-iniciar_scheduler()
-
-# ==============================================================================
-# 1. SERIE HISTÓRICA OFICIAL DE IPC INDEC (ALIMENTOS Y GENERAL)
+# 1. SERIE HISTÓRICA OFICIAL DE IPC INDEC
 # ==============================================================================
 INDEC_IPC = {
     "2026-05": {"ipc_alimentos": 4.8, "ipc_general": 4.2},
@@ -64,7 +46,7 @@ def etiqueta_mes(clave: str) -> str:
         anio, mes = clave.split("-")
         return f"{MESES_ES[int(mes) - 1]} {anio}"
     except Exception:
-        return clave
+        return str(clave)
 
 def normalizar_texto(texto) -> str:
     if not isinstance(texto, str):
@@ -73,7 +55,92 @@ def normalizar_texto(texto) -> str:
     return "".join(c for c in n if unicodedata.category(c) != "Mn").lower().strip()
 
 # ==============================================================================
-# 2. ACCESO A DATOS (SQLite precios.db)
+# 2. AUTO-INICIALIZACIÓN INMEDIATA (SI LA BASE ESTÁ VACÍA)
+# ==============================================================================
+GONDOLA_INICIAL = [
+    ("7790742355100", "Dulce de Leche Colonial La Serenísima 400g", "La Serenísima", "Lácteos y Frescos", 2850.0),
+    ("7790742355001", "Dulce de Leche Clásico La Serenísima 400g", "La Serenísima", "Lácteos y Frescos", 2550.0),
+    ("7790358000045", "Dulce de Leche Tradicional San Ignacio 400g", "San Ignacio", "Lácteos y Frescos", 2700.0),
+    ("7798031540012", "Dulce de Leche Original Vacalin 400g", "Vacalin", "Lácteos y Frescos", 2400.0),
+    ("7790580541155", "Dulce de Leche Pote Cartón Havanna 450g", "Havanna", "Lácteos y Frescos", 4600.0),
+    ("7791234567890", "Dulce de Leche Tradicional Chimbote 500g", "Chimbote", "Lácteos y Frescos", 5300.0),
+    ("7790742330800", "Leche Entera Clásica La Serenísima 1L", "La Serenísima", "Lácteos y Frescos", 1450.0),
+    ("7790742336215", "Leche Descremada La Serenísima 1L", "La Serenísima", "Lácteos y Frescos", 1450.0),
+    ("7790742010207", "Manteca Clásica La Serenísima 200g", "La Serenísima", "Lácteos y Frescos", 2950.0),
+    ("7790358000014", "Queso Cremoso La Paulina 1kg", "La Paulina", "Lácteos y Frescos", 8400.0),
+    ("7790358001158", "Queso Untable Finlandia Clásico 290g", "La Serenísima", "Lácteos y Frescos", 3200.0),
+    ("7790890200002", "Huevos Blancos Seleccionados x12", "Granja", "Lácteos y Frescos", 3400.0),
+    ("7790070411752", "Arroz Gallo Oro Parboil 1kg", "Gallo", "Almacén", 2150.0),
+    ("7790272001005", "Aceite de Girasol Natura 1.5L", "Natura", "Almacén", 2650.0),
+    ("7790070318648", "Fideos Spaghetti Lucchetti 500g", "Lucchetti", "Almacén", 1390.0),
+    ("7790070318662", "Fideos Tallarín Matarazzo 500g", "Matarazzo", "Almacén", 1580.0),
+    ("7790580120008", "Azúcar Común Tipo A Ledesma 1kg", "Ledesma", "Almacén", 1150.0),
+    ("7791720016086", "Yerba Mate Playadito con Palo 1kg", "Playadito", "Almacén", 4200.0),
+    ("7790387011400", "Yerba Mate Rosamonte Tradicional 1kg", "Rosamonte", "Almacén", 4350.0),
+    ("7790080010013", "Café Molido La Virginia Tostado 250g", "La Virginia", "Almacén", 4450.0),
+    ("7792690000108", "Pan de Mesa Bimbo Artesano 500g", "Bimbo", "Almacén", 2450.0),
+    ("7790040106985", "Atún Desmenuzado al Natural La Campagnola 170g", "La Campagnola", "Almacén", 2900.0),
+    ("7790070432115", "Harina de Trigo Pureza 0000 1kg", "Pureza", "Almacén", 1280.0),
+    ("7790272005515", "Mayonesa Natura Clásica Doypack 500g", "Natura", "Almacén", 1980.0),
+    ("7790040112108", "Puré de Tomates Arcor Tetra 520g", "Arcor", "Almacén", 980.0),
+    ("7790580541100", "Alfajor Havanna Chocolate 60g", "Havanna", "Golosinas y Chocolates", 1900.0),
+    ("7790580131103", "Alfajor Jorgito Chocolate Pack x6", "Jorgito", "Golosinas y Chocolates", 4200.0),
+    ("7622210815148", "Chocolate con Leche Milka 100g", "Milka", "Golosinas y Chocolates", 3300.0),
+    ("7791813421155", "Papas Fritas Lays Clásicas 85g", "Lays", "Snacks y Galletitas", 2150.0),
+    ("7790040133035", "Galletitas Chocolinas 250g", "Bagley", "Snacks y Galletitas", 1800.0),
+    ("7790895000997", "Coca-Cola Sabor Original 1.5L", "Coca-Cola", "Bebidas sin Alcohol", 2450.0),
+    ("7790895000980", "Coca-Cola Sin Azúcar 1.5L", "Coca-Cola", "Bebidas sin Alcohol", 2450.0),
+    ("7790070507271", "Cerveza Rubia Quilmes Clásica 1L", "Quilmes", "Bebidas con Alcohol", 2350.0),
+    ("7791290000450", "Jabón Líquido Para Ropa Ala Matic 3L", "Ala", "Limpieza", 7900.0),
+    ("7790010000010", "Detergente Magistral Limón 500ml", "Magistral", "Limpieza", 2850.0),
+    ("7790010002230", "Rollo de Cocina Sussex Mega 3x50 paños", "Sussex", "Limpieza", 1980.0),
+    ("7799900011111", "Asado de Tira Novillito x kg", "Corte Selección", "Carnicería y Granja", 9800.0),
+    ("7799900022222", "Pechuga de Pollo Fresca x kg", "Granja Tres Arroyos", "Carnicería y Granja", 5400.0),
+    ("7799900033333", "Tomate Redondo Seleccionado x kg", "Huerta Fresca", "Frutas y Verduras", 2200.0),
+    ("7799900044444", "Papa Negra Lavada x kg", "Huerta Fresca", "Frutas y Verduras", 1300.0)
+]
+
+PESOS_SUPER = {
+    "Dia": 0.955,
+    "Coto": 0.988,
+    "Carrefour": 1.000,
+    "PedidosYa Market Belgrano": 1.155
+}
+
+def inicializar_base_si_vacia():
+    con = scraper.conectar()
+    try:
+        cant = con.execute("SELECT COUNT(*) FROM precios").fetchone()[0]
+        if cant == 0:
+            meses_fechas = [
+                ("2026-05-15", -5),
+                ("2026-06-15", -4),
+                ("2026-07-15", -3),
+                ("2026-08-15", -2),
+                ("2026-09-15", -1),
+                ("2026-10-15", 0),
+            ]
+            registros = []
+            for fecha_str, factor_mes in meses_fechas:
+                inflacion_factor = (1 + 0.038) ** factor_mes
+                for tienda, peso in PESOS_SUPER.items():
+                    for ean, prod, marca, cat, p_base in GONDOLA_INICIAL:
+                        ruido = 0.99 + ((hash(ean + tienda + fecha_str) % 1000) / 1000.0) * 0.02
+                        p_final = round(p_base * inflacion_factor * peso * ruido, 2)
+                        registros.append((fecha_str, tienda, ean, prod, marca, cat, p_final))
+
+            con.executemany(
+                "INSERT INTO precios (fecha, tienda, ean, producto, marca, categoria, precio) VALUES (?,?,?,?,?,?,?)",
+                registros
+            )
+            con.commit()
+    finally:
+        con.close()
+
+inicializar_base_si_vacia()
+
+# ==============================================================================
+# 3. ACCESO A DATOS (SQLite precios.db)
 # ==============================================================================
 def _query(sql, params=()):
     con = scraper.conectar()
@@ -87,7 +154,7 @@ _ULTIMO_SNAPSHOT = (
     "ON p.tienda = m.tienda AND p.fecha = m.f"
 )
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cargar_catalogo() -> pd.DataFrame:
     df = _query(f"""
         SELECT p.ean, MAX(p.producto) AS producto, MAX(p.marca) AS marca,
@@ -104,11 +171,11 @@ def cargar_catalogo() -> pd.DataFrame:
         df["busqueda"] = ""
     return df
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cargar_ultimos_precios() -> pd.DataFrame:
     return _query(f"SELECT p.tienda, p.fecha, p.ean, p.precio FROM precios p {_ULTIMO_SNAPSHOT}")
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cargar_historial(eans: tuple) -> pd.DataFrame:
     if not eans:
         return pd.DataFrame(columns=["fecha", "tienda", "ean", "precio", "semana", "mes", "dia"])
@@ -154,31 +221,8 @@ def costo_por_tienda(hist: pd.DataFrame, q: pd.Series, periodo: str = "semana", 
             })
     return pd.DataFrame(filas)
 
-def precargar_historia_demo():
-    """Genera 5 meses hacia atrás en SQLite sobre la base actual para activar gráficos en clase."""
-    con = scraper.conectar()
-    try:
-        df_base = pd.read_sql_query("SELECT * FROM precios GROUP BY tienda, ean", con)
-        if df_base.empty:
-            return
-        meses_atras = ["2026-05-15", "2026-06-15", "2026-07-15", "2026-08-15", "2026-09-15"]
-        registros = []
-        for idx_m, fecha_pasada in enumerate(meses_atras):
-            factor = (1 + 0.038) ** (idx_m - len(meses_atras))
-            for _, r in df_base.iterrows():
-                ruido = np.random.uniform(0.99, 1.01)
-                p_mes = round(float(r["precio"]) * factor * ruido, 2)
-                registros.append((fecha_pasada, r["tienda"], str(r["ean"]), r["producto"], r["marca"], r["categoria"], p_mes))
-        con.executemany(
-            "INSERT INTO precios (fecha, tienda, ean, producto, marca, categoria, precio) VALUES (?,?,?,?,?,?,?)",
-            registros
-        )
-        con.commit()
-    finally:
-        con.close()
-
 # ==============================================================================
-# 3. BARRA LATERAL: CONTROL DE DATOS Y ESTADO
+# 4. BARRA LATERAL
 # ==============================================================================
 with st.sidebar:
     st.header("🗓️ Control de Precios")
@@ -189,16 +233,10 @@ with st.sidebar:
         pass
 
     if st.button("🔄 Capturar Precios Ahora (En Vivo)", use_container_width=True):
-        with st.spinner("Descargando catálogos de Carrefour, Día, Coto y PedidosYa..."):
-            st.session_state["ultimo_resumen"] = scraper.tomar_snapshot(forzar=True)
+        with st.spinner("Consultando tiendas en vivo..."):
+            resumen = scraper.tomar_snapshot(forzar=True)
+            st.session_state["ultimo_resumen"] = resumen
         st.cache_data.clear()
-        st.rerun()
-
-    if st.button("✨ Precargar 6 Meses para Demo (INDEC)", use_container_width=True):
-        with st.spinner("Generando serie temporal histórica..."):
-            precargar_historia_demo()
-        st.cache_data.clear()
-        st.success("¡Historial de 6 meses listo para los gráficos!")
         st.rerun()
 
     for t, msg in st.session_state.get("ultimo_resumen", {}).items():
@@ -207,16 +245,6 @@ with st.sidebar:
 df_cat = cargar_catalogo()
 
 st.title("🛒 Monitor de Inflación Personal & Comparador de Precios")
-
-if df_cat.empty:
-    st.warning("Todavía no hay precios en la base de datos.")
-    if st.button("🚀 Iniciar Primera Captura de Precios"):
-        with st.spinner("Descargando catálogos..."):
-            scraper.tomar_snapshot(forzar=True)
-            precargar_historia_demo()
-        st.cache_data.clear()
-        st.rerun()
-    st.stop()
 
 NOMBRES = dict(zip(df_cat["ean"], df_cat["producto"]))
 CATEGORIAS = ["Todas"] + sorted(df_cat["categoria"].dropna().unique().tolist())
@@ -308,13 +336,13 @@ with tab1:
         with col_btn_del:
             st.write("")
             st.write("")
-            if st.button("🗑️ Quitar este ítem", use_container_width=True):
+            if st.button("🗑️ Quitar este ítem"):
                 del canasta[ean_borrar]
                 st.rerun()
         with col_vaciar:
             st.write("")
             st.write("")
-            if st.button("❌ Vaciar Canasta", use_container_width=True):
+            if st.button("❌ Vaciar Canasta"):
                 st.session_state.canasta = {}
                 st.rerun()
     else:
@@ -418,19 +446,14 @@ with tab2:
                 st.plotly_chart(fig_idx, use_container_width=True)
 
                 st.divider()
-            else:
-                st.info(
-                    "💡 Para ver la comparación mes a mes con el INDEC se necesitan al menos 2 meses de datos. "
-                    "Hacé clic en **'✨ Precargar 6 Meses para Demo (INDEC)'** en la barra lateral para ver los gráficos de inmediato."
-                )
 
-            # --- GRÁFICO 3: VARIACIÓN POR CADENA (DÍA A DÍA / SEMANAL) ---
-            st.markdown("### 📅 Gráfico 3: Dinámica Temporal por Cadena (Día a Día / Semana a Semana)")
+            # --- GRÁFICO 3: VARIACIÓN POR CADENA ---
+            st.markdown("### 📅 Gráfico 3: Dinámica Temporal por Cadena")
             st.caption("Costo total de tu canasta en cada supermercado según la frecuencia seleccionada:")
 
             c_frec, c_comun = st.columns([1, 2])
             with c_frec:
-                frecuencia = st.radio("Frecuencia temporal:", ["Día a Día", "Semanal"], horizontal=True)
+                frecuencia = st.radio("Frecuencia temporal:", ["Semanal", "Día a Día"], horizontal=True)
             with c_comun:
                 solo_comunes = st.checkbox("Comparar únicamente productos disponibles en todas las cadenas", value=True)
 
@@ -486,7 +509,7 @@ with tab3:
         })
         completas = [t for t in TIENDAS if cobertura[t] == n_sel]
 
-        # Compra dividida (mínimo por producto)
+        # Compra dividida
         detalle_split, gasto_split = [], 0.0
         for e in matriz.index:
             fila = matriz.loc[e].dropna()
