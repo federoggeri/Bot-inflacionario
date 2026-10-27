@@ -88,6 +88,27 @@ def cargar_historial(eans: tuple) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cargar_cambios() -> pd.DataFrame:
+    """Compara, por cadena, los dos snapshots más recientes."""
+    df = _query("""
+        WITH f AS (
+            SELECT tienda, fecha, ROW_NUMBER() OVER (PARTITION BY tienda ORDER BY fecha DESC) AS rn
+            FROM (SELECT DISTINCT tienda, fecha FROM precios))
+        SELECT p.tienda, p.ean, p.producto, p.categoria, f.rn, f.fecha, p.precio
+        FROM precios p JOIN f ON p.tienda = f.tienda AND p.fecha = f.fecha
+        WHERE f.rn <= 2""")
+    if df.empty:
+        return df
+    act = df[df["rn"] == 1].set_index(["tienda", "ean"])
+    ant = df[df["rn"] == 2].set_index(["tienda", "ean"])[["precio", "fecha"]]
+    out = act.join(ant, rsuffix="_ant", how="inner").reset_index()
+    out = out.rename(columns={"precio": "precio_actual", "precio_ant": "precio_anterior",
+                              "fecha": "fecha_actual", "fecha_ant": "fecha_anterior"})
+    out["var_pct"] = (out["precio_actual"] / out["precio_anterior"] - 1) * 100
+    return out
+
+
 def matriz_precios(hist: pd.DataFrame, periodo: str) -> pd.DataFrame:
     """Precio medio por período y producto; completa huecos para mantener la misma canasta."""
     return (hist.groupby([periodo, "ean"])["precio"].mean()
@@ -115,39 +136,89 @@ def costo_por_tienda(hist: pd.DataFrame, q: pd.Series, solo_comunes: bool) -> pd
 
 
 # ==============================================================================
-# 3. BARRA LATERAL: ESTADO DE LOS SNAPSHOTS
+# 3. DESCARGA AUTOMÁTICA AL ENTRAR + BARRA LATERAL DE ESTADO
 # ==============================================================================
+SCRAPER_PY = Path(scraper.__file__).resolve()
+
+
+def lanzar_scraper(forzar=False):
+    """Lanza scraper.py como proceso aparte (no bloquea la app). El lock evita duplicados."""
+    if scraper.hay_descarga_en_curso():
+        return
+    cmd = [sys.executable, str(SCRAPER_PY)] + (["--forzar"] if forzar else [])
+    kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+    with open(SCRAPER_PY.parent / "scraper.log", "ab") as salida:
+        subprocess.Popen(cmd, cwd=str(SCRAPER_PY.parent), stdout=salida, stderr=subprocess.STDOUT, **kw)
+    st.session_state["_lanzado_ts"] = pd.Timestamp.now()
+
+
+def descarga_automatica():
+    """Al abrir la app: si falta algún snapshot (o pasó el intervalo), lo baja en segundo plano."""
+    reciente = st.session_state.get("_lanzado_ts")
+    if reciente is not None and (pd.Timestamp.now() - reciente).seconds < 90:
+        return
+    if scraper.tiendas_pendientes():
+        lanzar_scraper()
+
+
+@st.fragment(run_every=15)
+def panel_estado():
+    estado = scraper.estado_snapshots()
+    st.dataframe(estado, hide_index=True)
+    if scraper.hay_descarga_en_curso():
+        st.info("⏳ Descargando precios en segundo plano. Esta página se actualiza sola.")
+    # si cambió algún snapshot, refresca los datos de toda la app
+    firma = tuple(zip(estado["Último snapshot"], estado["Productos"]))
+    previa = st.session_state.get("_firma")
+    st.session_state["_firma"] = firma
+    if previa is not None and previa != firma:
+        st.cache_data.clear()
+        st.rerun()
+
+
+descarga_automatica()
+
 with st.sidebar:
-    st.header("🗓️ Snapshots semanales")
-    st.caption("Los snapshots los toma `scraper.py` (programado en tu PC); esta app solo lee la base.")
-    st.dataframe(scraper.estado_snapshots(), hide_index=True)
-    if st.button("🔄 Actualizar precios ahora"):
-        subprocess.Popen([sys.executable, str(Path(scraper.__file__).resolve()), "--forzar"],
-                         cwd=str(Path(scraper.__file__).resolve().parent))
-        st.info("Descarga iniciada en segundo plano. Puede tardar un buen rato; refrescá esta página más tarde.")
+    st.header("🗓️ Estado de los precios")
+    st.caption(f"Se toma un snapshot por cadena cada {scraper.INTERVALO_DIAS} día(s), automáticamente al abrir la app "
+               "(y también por la tarea programada, si la configuraste).")
+    panel_estado()
+    if st.button("🔄 Forzar actualización ahora"):
+        lanzar_scraper(forzar=True)
+        st.toast("Descarga iniciada en segundo plano", icon="⏳")
+    st.caption("Detalles técnicos en `scraper.log`.")
 
 df_cat = cargar_catalogo()
 
 st.title("🛒 Monitor de Inflación Personal & Comparador de Precios")
 
 if df_cat.empty:
-    st.warning("Todavía no hay precios guardados. Corré `python scraper.py` o usá el botón "
-               "**Actualizar precios ahora** de la barra lateral para tomar el primer snapshot.")
+    if scraper.hay_descarga_en_curso():
+        st.info("⏳ Estoy descargando los precios por primera vez. La primera cadena puede tardar varios minutos; "
+                "esta página se completa sola apenas haya datos.")
+    else:
+        st.error("Todavía no hay precios y no hay una descarga en curso. Mirá la columna **Último intento** "
+                 "en la barra lateral y el archivo `scraper.log` para ver qué falló.")
     st.stop()
 
 NOMBRES = dict(zip(df_cat["ean"], df_cat["producto"]))
 CATEGORIAS = ["Todas"] + sorted(df_cat["categoria"].dropna().unique().tolist())
+_con_datos = set(cargar_ultimos_precios()["tienda"])
 st.caption(f"Base de góndola activa: **{len(df_cat):,} productos** (por EAN) | "
-           f"Comercios: {', '.join(TIENDAS)}")
+           f"Comercios con datos: {', '.join(t for t in TIENDAS if t in _con_datos)}")
+_sin_datos = [t for t in TIENDAS if t not in _con_datos]
+if _sin_datos:
+    st.warning(f"Todavía sin precios de: {', '.join(_sin_datos)}. Mirá su estado en la barra lateral.")
 
 if "canasta" not in st.session_state:
     st.session_state.canasta = {}       # {ean: cantidad mensual}
 canasta = st.session_state.canasta
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🧺 1. Armar y Editar Canasta",
     "📈 2. Análisis de Inflación vs. IPC INDEC",
     "🎯 3. Optimizador de Faltantes",
+    "🔔 4. Cambios de precio",
 ])
 
 # ==============================================================================
@@ -256,7 +327,7 @@ with tab2:
 
             if len(costo_mes) < 2:
                 st.info("La comparación mes a mes con el INDEC necesita snapshots de **al menos 2 meses distintos**. "
-                        "Mientras se acumula el historial, podés ver la evolución semanal más abajo (Gráfico 3).")
+                        "Mientras tanto, mirá la pestaña **4. Cambios de precio** y el Gráfico 3 (evolución por snapshot).")
             else:
                 df_graf = costo_mes.iloc[1:].copy()
                 gasto_inicio = costo_mes["gasto_item"].iloc[0]
@@ -419,3 +490,78 @@ with tab3:
             st.caption(f"⚠️ Sin precio en ninguna cadena: {', '.join(sin_precio)}")
     else:
         st.info("Seleccioná productos en la lista para ver la comparativa de supermercados.")
+
+
+# ==============================================================================
+# PESTAÑA 4: CAMBIOS DE PRECIO ENTRE SNAPSHOTS
+# ==============================================================================
+with tab4:
+    st.subheader("4. ¿Aumentaron o bajaron los precios?")
+    cambios = cargar_cambios()
+    if cambios.empty:
+        st.info(f"Por ahora hay **un solo snapshot** por cadena, así que todavía no hay contra qué comparar. "
+                f"El siguiente se toma solo cuando pasen {scraper.INTERVALO_DIAS} día(s) desde el primero y esta "
+                "pestaña se completa automáticamente. Para comparar antes, ejecutá el scraper con "
+                "`INTERVALO_DIAS=1` (snapshots diarios).")
+    else:
+        f1, f2, f3 = st.columns([2, 2, 1])
+        with f1:
+            tiendas_sel = st.multiselect("Cadenas:", sorted(cambios["tienda"].unique()),
+                                         default=sorted(cambios["tienda"].unique()))
+        with f2:
+            cat4 = st.selectbox("Categoría:", ["Todas"] + sorted(cambios["categoria"].dropna().unique().tolist()),
+                                key="cat_cambios")
+        with f3:
+            solo_canasta = st.checkbox("Solo mi canasta", value=False, disabled=not canasta)
+
+        d = cambios[cambios["tienda"].isin(tiendas_sel)]
+        if cat4 != "Todas":
+            d = d[d["categoria"] == cat4]
+        if solo_canasta:
+            d = d[d["ean"].isin(canasta)]
+
+        if d.empty:
+            st.warning("No hay productos comparables con esos filtros.")
+        else:
+            umbral = 0.01
+            n = len(d)
+            suben = (d["var_pct"] > umbral).sum()
+            bajan = (d["var_pct"] < -umbral).sum()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Productos comparados", f"{n:,}")
+            m2.metric("Subieron", f"{suben / n * 100:.1f}%", f"{suben:,} productos", delta_color="inverse")
+            m3.metric("Bajaron", f"{bajan / n * 100:.1f}%", f"{bajan:,} productos", delta_color="off")
+            m4.metric("Variación promedio", f"{d['var_pct'].mean():+.2f}%",
+                      f"mediana {d['var_pct'].median():+.2f}%", delta_color="off")
+
+            resumen = d.groupby("tienda").agg(
+                comparados=("ean", "count"),
+                suben=("var_pct", lambda s: int((s > umbral).sum())),
+                bajan=("var_pct", lambda s: int((s < -umbral).sum())),
+                var_promedio=("var_pct", "mean"),
+                desde=("fecha_anterior", "min"),
+                hasta=("fecha_actual", "max"),
+            ).reset_index()
+            resumen.columns = ["Cadena", "Comparados", "Subieron", "Bajaron", "Var. promedio (%)", "Desde", "Hasta"]
+            st.dataframe(resumen, hide_index=True,
+                         column_config={"Var. promedio (%)": st.column_config.NumberColumn(format="%+.2f%%")})
+
+            fig_h = px.histogram(d[d["var_pct"].between(-50, 50)], x="var_pct", color="tienda", nbins=80,
+                                 barmode="overlay", opacity=0.65,
+                                 labels={"var_pct": "Variación de precio (%)", "tienda": "Cadena"},
+                                 title="Distribución de variaciones de precio entre snapshots (recortada a ±50%)")
+            st.plotly_chart(fig_h)
+
+            cols = {"producto": "Producto", "tienda": "Cadena", "precio_anterior": "Precio anterior ($)",
+                    "precio_actual": "Precio actual ($)", "var_pct": "Variación (%)"}
+            fmt = {"Variación (%)": st.column_config.NumberColumn(format="%+.2f%%")}
+            t1, t2 = st.columns(2)
+            with t1:
+                st.markdown("#### 🔺 Mayores aumentos")
+                st.dataframe(d.nlargest(25, "var_pct")[list(cols)].rename(columns=cols),
+                             hide_index=True, column_config=fmt)
+            with t2:
+                st.markdown("#### 🔻 Mayores bajas")
+                st.dataframe(d.nsmallest(25, "var_pct")[list(cols)].rename(columns=cols),
+                             hide_index=True, column_config=fmt)
+            st.caption("Variaciones extremas (más de ±100%) suelen ser cambios de presentación o errores de captura.")
