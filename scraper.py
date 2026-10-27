@@ -1,11 +1,22 @@
 """
 scraper.py
-Toma un snapshot automático de precios de Carrefour, Dia, Coto y
+Toma un snapshot de precios (1 vez por semana) de Carrefour, Dia, Coto y
 PedidosYa Market Belgrano y lo guarda en SQLite (precios.db).
-Descarga de forma 100% autónoma las 4 cadenas sin requerir archivos CSV manuales.
+
+Uso:
+    python scraper.py                    # snapshot de las tiendas con >= 7 dias sin actualizarse
+    python scraper.py --forzar           # fuerza el snapshot de todas las tiendas
+    python scraper.py --solo Coto --debug --visible   # probar una tienda y volcar JSON a debug/
+    python scraper.py --login Coto       # elegir sucursal/direccion una vez y guardar la sesion
+    python scraper.py --daemon           # queda corriendo y toma el snapshot cuando corresponde
+
+Es seguro correrlo todos los dias: cada tienda se omite si su ultimo
+snapshot tiene menos de 7 dias.
 """
 import argparse
+import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -14,25 +25,20 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "precios.db"
+MANUAL_DIR = BASE_DIR / "manual"      # CSVs de respaldo: manual/<Tienda>.csv
 INTERVALO_DIAS = 7
-PAUSA_ENTRE_REQUESTS = 0.25
-
-HEADERS_BROWSER = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "es-419,es;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-}
+PAUSA_ENTRE_REQUESTS = 0.3            # segundos, para no saturar los servidores
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MonitorPrecios/1.0)"}
 
 log = logging.getLogger("scraper")
 _LOCK = threading.Lock()
 
 
 # ==============================================================================
-# BASE DE DATOS SQLITE
+# BASE DE DATOS
 # ==============================================================================
 def conectar() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=60)
@@ -61,13 +67,19 @@ def _ultima_fecha(con, tienda):
     return fila[0] if fila else None
 
 
+def _cantidad(con, tienda, fecha):
+    return con.execute(
+        "SELECT COUNT(*) FROM precios WHERE tienda=? AND fecha=?", (tienda, fecha)
+    ).fetchone()[0]
+
+
 def _guardar(con, tienda, fecha, df):
     con.execute("DELETE FROM precios WHERE tienda=? AND fecha=?", (tienda, fecha))
     con.executemany(
         "INSERT INTO precios (fecha, tienda, ean, producto, marca, categoria, precio) "
         "VALUES (?,?,?,?,?,?,?)",
         [
-            (fecha, tienda, str(r.ean), str(r.producto), str(r.marca), str(r.categoria), float(r.precio))
+            (fecha, tienda, r.ean, r.producto, r.marca, r.categoria, float(r.precio))
             for r in df.itertuples(index=False)
         ],
     )
@@ -75,19 +87,42 @@ def _guardar(con, tienda, fecha, df):
 
 
 # ==============================================================================
-# 1. ADAPTADOR VTEX AUTOMÁTICO (Carrefour y Dia)
+# ADAPTADOR VTEX (Carrefour y Dia)
 # ==============================================================================
-def _get_json(url, params=None, reintentos=3):
+def _get_json(url, params=None, reintentos=4):
+    """Devuelve el JSON, o None si fallo tras los reintentos."""
     for i in range(reintentos):
         try:
-            r = requests.get(url, params=params, headers=HEADERS_BROWSER, timeout=20)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
             if r.status_code in (200, 206):
                 return r.json()
-            if r.status_code in (429, 500, 502, 503):
-                time.sleep(1.5 * (i + 1))
-        except Exception:
-            time.sleep(1)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2 * (i + 1))
+                continue
+            return None
+        except (requests.RequestException, ValueError):
+            time.sleep(1 + i)
     return None
+
+
+def _categorias_vtex(base):
+    """Devuelve [(id_categoria_hoja, nombre_categoria_principal)]."""
+    arbol = _get_json(f"{base}/api/catalog_system/pub/category/tree/3")
+    if not arbol:
+        raise RuntimeError(f"No pude leer el arbol de categorias de {base}")
+    hojas = []
+
+    def rec(nodo, top):
+        hijos = nodo.get("children") or []
+        if hijos:
+            for h in hijos:
+                rec(h, top)
+        else:
+            hojas.append((nodo["id"], top))
+
+    for n in arbol:
+        rec(n, n["name"])
+    return hojas
 
 
 def _precio_disponible(item):
@@ -99,181 +134,364 @@ def _precio_disponible(item):
 
 
 def descargar_vtex(base):
-    """Descarga productos por categorías y paginación desde VTEX."""
+    """
+    VTEX devuelve 50 productos por request y no permite pasar de ~2500 por
+    consulta. Por eso se recorre categoria por categoria (hojas del arbol).
+    """
     filas = {}
-    try:
-        arbol = _get_json(f"{base}/api/catalog_system/pub/category/tree/2") or []
-        cat_ids = [(c["id"], c["name"]) for c in arbol if "id" in c]
-    except Exception:
-        cat_ids = [(1, "Alimentos")]
-
-    for cat_id, cat_nom in cat_ids[:15]:
+    hojas = _categorias_vtex(base)
+    truncadas, fallidas = [], 0
+    for i, (cat_id, cat_top) in enumerate(hojas, 1):
         desde = 0
-        while desde < 500:  # Lote amplio por categoría
+        while True:
             lote = _get_json(
                 f"{base}/api/catalog_system/pub/products/search",
                 params={"fq": f"C:{cat_id}", "_from": desde, "_to": desde + 49},
             )
+            if lote is None:
+                fallidas += 1
+                break
             if not lote:
                 break
             for p in lote:
                 for it in p.get("items", []):
                     ean = (it.get("ean") or "").strip()
-                    if not ean or len(ean) < 8:
+                    if not ean:
                         continue
                     precio = _precio_disponible(it)
-                    if precio:
-                        filas[ean] = {
-                            "ean": ean,
-                            "producto": p.get("productName", "").strip(),
-                            "marca": p.get("brand", "").strip(),
-                            "categoria": cat_nom,
-                            "precio": precio,
-                        }
+                    if precio is None:
+                        continue
+                    filas[ean] = {
+                        "ean": ean,
+                        "producto": p.get("productName", ""),
+                        "marca": p.get("brand", ""),
+                        "categoria": cat_top,
+                        "precio": precio,
+                    }
             if len(lote) < 50:
                 break
             desde += 50
+            if desde >= 2500:
+                truncadas.append(cat_id)
+                break
             time.sleep(PAUSA_ENTRE_REQUESTS)
+        if i % 25 == 0:
+            log.info("%s: %d/%d categorias, %d productos", base, i, len(hojas), len(filas))
+        time.sleep(PAUSA_ENTRE_REQUESTS)
+    if truncadas:
+        log.warning("%s: %d categorias llegaron al tope de 2500 y pueden estar incompletas", base, len(truncadas))
+    if fallidas:
+        log.warning("%s: %d requests fallaron tras reintentos", base, fallidas)
     return pd.DataFrame(list(filas.values()))
 
 
 # ==============================================================================
-# 2. ADAPTADOR AUTOMÁTICO DE COTO DIGITAL
+# RESPALDO POR CSV
 # ==============================================================================
-def descargar_coto():
-    """Scraping directo del catálogo web de Coto Digital por departamentos."""
-    filas = {}
-    categorias_coto = [
-        ("catalogo-almacen", "Almacén"),
-        ("catalogo-bebidas", "Bebidas"),
-        ("catalogo-frescos", "Lácteos y Frescos"),
-        ("catalogo-limpieza", "Limpieza"),
-    ]
+def importar_csv(tienda):
+    """Lee manual/<tienda>.csv con columnas: ean, producto, precio (marca y categoria opcionales)."""
+    ruta = MANUAL_DIR / f"{tienda}.csv"
+    if not ruta.exists():
+        raise FileNotFoundError(f"No existe el CSV de respaldo {ruta}")
+    df = pd.read_csv(ruta, dtype={"ean": str})
+    for col in ("marca", "categoria"):
+        if col not in df.columns:
+            df[col] = ""
+    return df[["ean", "producto", "marca", "categoria", "precio"]]
 
-    for slug, cat_nom in categorias_coto:
-        url = f"https://www.cotodigital3.com.ar/sitios/cdigi/browse/{slug}/"
+
+# ==============================================================================
+# EXTRACTOR GENÉRICO DE PRODUCTOS DESDE JSON
+# Busca, en cualquier JSON que cargue la página, objetos que tengan nombre + precio + EAN.
+# ==============================================================================
+_K_NOMBRE = ("productname", "product_name", "name", "nombre", "title", "value", "description", "descripcion")
+_K_PRECIO = ("preciofinal", "final_price", "finalprice", "saleprice", "sale_price", "price", "precio",
+             "preciolista", "list_price", "listprice")
+_K_EAN = ("ean", "ean13", "eancode", "gtin", "gtin13", "barcode", "codigobarras", "codigo_de_barras", "upc")
+_K_MARCA = ("brand", "marca", "brandname")
+_SIN_EAN = {"n": 0}
+
+
+def _num(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = re.sub(r"[^\d,.\-]", "", v)
+        if not s:
+            return None
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
+        elif "," in s:
+            s = s.replace(",", ".")
         try:
-            r = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "html.parser")
-                productos_html = soup.select(".product_info_container, .grid_view li, .sub_category_grid li")
-                for p in productos_html:
-                    nombre_tag = p.select_one(".descrip_full, .product_info, .title")
-                    precio_tag = p.select_one(".atg_store_newPrice, .price_discount, .first_price_card")
-                    
-                    if nombre_tag and precio_tag:
-                        nombre = nombre_tag.get_text(strip=True)
-                        precio_txt = precio_tag.get_text(strip=True).replace("$", "").replace(".", "").replace(",", ".").strip()
-                        try:
-                            precio = float(precio_txt)
-                            # Coto usa IDs numéricos como PLU/EAN en sus etiquetas de producto
-                            ean_pseudo = f"77900{abs(hash(nombre)) % 100000000:08d}"
-                            filas[ean_pseudo] = {
-                                "ean": ean_pseudo,
-                                "producto": nombre,
-                                "marca": "Coto",
-                                "categoria": cat_nom,
-                                "precio": precio
-                            }
-                        except ValueError:
-                            continue
-            time.sleep(PAUSA_ENTRE_REQUESTS)
-        except Exception as e:
-            log.warning("No se pudo conectar directamente a Coto: %s", e)
-            break
+            return float(s)
+        except ValueError:
+            return None
+    if isinstance(v, dict):
+        for k in ("value", "amount", "price", "final", "current"):
+            if k in v:
+                n = _num(v[k])
+                if n:
+                    return n
+    return None
 
-    # Respaldo automático si la IP de la nube es bloqueada por Cloudflare/Coto
-    if not filas:
-        return sincronizar_con_referencia(factor_precio=0.988)
 
-    return pd.DataFrame(list(filas.values()))
+def _extraer_productos(obj, categoria=""):
+    out = []
+
+    def rec(x):
+        if isinstance(x, dict):
+            plano = {str(k).lower(): v for k, v in x.items()}
+            data = x.get("data")
+            if isinstance(data, dict):                       # estilo Constructor: {"value": nombre, "data": {...}}
+                for k, v in data.items():
+                    plano.setdefault(str(k).lower(), v)
+            nombre = next((plano[k].strip() for k in _K_NOMBRE
+                           if isinstance(plano.get(k), str) and plano[k].strip()), None)
+            precio = next((n for k in _K_PRECIO if k in plano
+                           for n in [_num(plano[k])] if n and n > 0), None)
+            ean = next((str(plano[k]).strip() for k in _K_EAN
+                        if k in plano and re.fullmatch(r"\d{8,14}", str(plano[k]).strip())), None)
+            if nombre and precio:
+                if ean:
+                    marca = next((str(plano[k]) for k in _K_MARCA if isinstance(plano.get(k), str)), "")
+                    out.append({"ean": ean, "producto": nombre, "marca": marca,
+                                "categoria": categoria, "precio": precio})
+                else:
+                    _SIN_EAN["n"] += 1
+                return
+            for v in x.values():
+                rec(v)
+        elif isinstance(x, list):
+            for v in x:
+                rec(v)
+
+    rec(obj)
+    return out
 
 
 # ==============================================================================
-# 3. ADAPTADOR AUTOMÁTICO DE PEDIDOSYA MARKET (BELGRANO)
+# ADAPTADORES POR NAVEGADOR (Coto y PedidosYa Market) — Playwright
+#   pip install playwright && playwright install chromium
 # ==============================================================================
-def descargar_pedidosya():
-    """Consulta directa a la API de PedidosYa usando geolocalización de Belgrano."""
-    filas = {}
-    # Coordenadas de Belgrano (Av. Cabildo y Juramento, CABA)
-    lat, lng = -34.5626, -58.4568
-    terminos_busqueda = ["leche", "arroz", "aceite", "yerba", "galletitas", "gaseosa", "fideos", "queso", "jabon"]
+CONFIG_DIR = BASE_DIR / "config"        # coto_categorias.txt, pedidosya_urls.txt
+STATE_DIR = BASE_DIR / "estado_sesion"  # sesión guardada (sucursal / dirección)
+DEBUG_DIR = BASE_DIR / "debug"
+COTO_HOME = "https://www.cotodigital.com.ar/sitios/cdigi/"
+COTO_MAX_PAGINAS = 400
+PY_MAX_SCROLLS = 120
+DEBUG = False
+HEADLESS = True
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
 
-    headers_pya = {
-        **HEADERS_BROWSER,
-        "Platform": "DESKTOP",
-        "Application": "SEARCH"
-    }
 
-    for term in terminos_busqueda:
-        url = "https://server.pedidosya.com/v4/search/products"
-        params = {
-            "query": term,
-            "latitude": lat,
-            "longitude": lng,
-            "businessType": "GROCERIES",
-            "max": 30
-        }
+def _leer_urls(ruta):
+    if not ruta.exists():
+        return []
+    return [l.strip() for l in ruta.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")]
+
+
+def _nuevo_contexto(pw, tienda, headless):
+    browser = pw.chromium.launch(headless=headless)
+    kw = dict(locale="es-AR", timezone_id="America/Argentina/Buenos_Aires",
+              user_agent=UA, viewport={"width": 1366, "height": 900})
+    estado = STATE_DIR / f"{tienda}.json"
+    if estado.exists():
+        kw["storage_state"] = str(estado)
+    return browser, browser.new_context(**kw)
+
+
+class _Captura:
+    """Registra las respuestas JSON (XHR/fetch) que dispara la página y extrae productos."""
+
+    def __init__(self, page, tienda):
+        self.page, self.tienda, self.pendientes, self.n = page, tienda, [], 0
+        page.on("response", self._on)
+
+    def _on(self, resp):
         try:
-            r = requests.get(url, params=params, headers=headers_pya, timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                for prod in data.get("products", []):
-                    ean = (prod.get("barcode") or str(prod.get("id"))).strip()
-                    nombre = prod.get("name", "").strip()
-                    precio = float(prod.get("price", 0))
-                    if ean and precio > 0:
-                        filas[ean] = {
-                            "ean": ean,
-                            "producto": nombre,
-                            "marca": prod.get("brand", "PedidosYa"),
-                            "categoria": "Almacén",
-                            "precio": precio
-                        }
-            time.sleep(PAUSA_ENTRE_REQUESTS)
-        except Exception as e:
-            log.warning("No se pudo consultar API de PedidosYa: %s", e)
-            break
+            if resp.request.resource_type in ("xhr", "fetch") and "json" in (resp.headers.get("content-type") or ""):
+                self.pendientes.append(resp)
+        except Exception:
+            pass
 
-    # Respaldo automático si la IP de la nube es bloqueada
-    if not filas:
-        return sincronizar_con_referencia(factor_precio=1.155)
+    def _volcar(self, url, data):
+        d = DEBUG_DIR / re.sub(r"\W+", "_", self.tienda)
+        d.mkdir(parents=True, exist_ok=True)
+        self.n += 1
+        txt = json.dumps({"url": url, "data": data}, ensure_ascii=False)[:200000]
+        (d / f"{self.n:04d}.txt").write_text(txt, encoding="utf-8")
 
-    return pd.DataFrame(list(filas.values()))
+    def vaciar(self, categoria=""):
+        prods = []
+        pend, self.pendientes = self.pendientes, []
+        jsons = []
+        for r in pend:
+            try:
+                jsons.append((r.url, r.json()))
+            except Exception:
+                continue
+        try:   # JSON embebido en el HTML (SSR / __NEXT_DATA__ / ld+json)
+            for txt in self.page.eval_on_selector_all(
+                    'script[type="application/json"], script[type="application/ld+json"]',
+                    "els => els.map(e => e.textContent)"):
+                try:
+                    jsons.append(("html-embebido", json.loads(txt)))
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        for url, data in jsons:
+            if DEBUG:
+                self._volcar(url, data)
+            prods.extend(_extraer_productos(data, categoria))
+        return prods
 
 
-# ==============================================================================
-# SINCRONIZADOR DE RESPALDO (Garantiza 100% de productos coincidentes)
-# ==============================================================================
-def sincronizar_con_referencia(factor_precio: float) -> pd.DataFrame:
-    """
-    Si Coto o PedidosYa bloquean la IP de Streamlit Cloud (EE.UU.), este mecanismo
-    toma los mismos EANs descargados de Carrefour y Día y calcula sus precios reales
-    en base a la relación de mercado de la cadena (evita que la base quede vacía).
-    """
-    con = conectar()
+def _esperar(page, scrolls=3):
     try:
-        df_ref = pd.read_sql_query(
-            "SELECT ean, producto, marca, categoria, precio FROM precios "
-            "WHERE tienda IN ('Carrefour', 'Dia') GROUP BY ean", con
-        )
-    finally:
-        con.close()
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    for _ in range(scrolls):
+        page.mouse.wheel(0, 3000)
+        page.wait_for_timeout(500)
 
-    if df_ref.empty:
-        return pd.DataFrame(columns=["ean", "producto", "marca", "categoria", "precio"])
 
-    df_clon = df_ref.copy()
-    # Aplica la brecha estructural de precios de la tienda
-    df_clon["precio"] = (df_clon["precio"] * factor_precio).round(2)
-    return df_clon
+def _categorias_coto(page):
+    """Devuelve [(url, nombre)] de categorías hoja, a partir del menú de Coto Digital + config manual."""
+    page.goto(COTO_HOME, wait_until="domcontentloaded", timeout=60000)
+    _esperar(page, scrolls=1)
+    links = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+    por_id = {}
+    for h in links:
+        if "/productos/categorias/" not in h:
+            continue
+        m = re.search(r"/categorias/([^/?#]+)/(catv\d+)", h)
+        if m:
+            por_id[m.group(2)] = (h.split("?")[0], m.group(1))
+    # hoja = slug que no es prefijo de otro slug (los slugs son jerárquicos: padre-hijo)
+    slugs = [s for _, s in por_id.values()]
+    hojas = [(u, s) for u, s in por_id.values() if not any(o != s and o.startswith(s + "-") for o in slugs)]
+    manuales = [(u.split("?")[0], u.split("/")[-2] if "/" in u else u) for u in _leer_urls(CONFIG_DIR / "coto_categorias.txt")]
+    resultado = {u: n for u, n in hojas + manuales}
+    if not resultado:
+        raise RuntimeError("No encontré categorías en Coto. Pegá URLs de categoría en config/coto_categorias.txt")
+    return list(resultado.items())
+
+
+def descargar_coto():
+    from playwright.sync_api import sync_playwright
+    filas = {}
+    with sync_playwright() as pw:
+        browser, ctx = _nuevo_contexto(pw, "Coto", HEADLESS)
+        try:
+            page = ctx.new_page()
+            cap = _Captura(page, "Coto")
+            categorias = _categorias_coto(page)
+            log.info("Coto: %d categorías para recorrer", len(categorias))
+            for i, (url, nombre) in enumerate(categorias, 1):
+                anterior = set()
+                for n in range(1, COTO_MAX_PAGINAS + 1):
+                    page.goto(f"{url}?page={n}", wait_until="domcontentloaded", timeout=60000)
+                    _esperar(page)
+                    prods = cap.vaciar(nombre)
+                    eans = {p["ean"] for p in prods}
+                    if not eans or eans == anterior:      # página vacía o repetida = fin de la categoría
+                        break
+                    anterior = eans
+                    for p in prods:
+                        filas[p["ean"]] = p
+                    time.sleep(PAUSA_ENTRE_REQUESTS)
+                if i % 10 == 0:
+                    log.info("Coto: %d/%d categorías, %d productos", i, len(categorias), len(filas))
+        finally:
+            ctx.close()
+            browser.close()
+    if not filas:
+        raise RuntimeError("No capturé ningún producto de Coto (con EAN y precio). "
+                           "Corré `python scraper.py --solo Coto --debug --visible` y mirá la carpeta debug/")
+    if _SIN_EAN["n"]:
+        log.warning("Coto: %d objetos con nombre y precio pero sin EAN fueron ignorados", _SIN_EAN["n"])
+    return pd.DataFrame(list(filas.values()))
+
+
+def descargar_pedidosya():
+    from playwright.sync_api import sync_playwright
+    urls = _leer_urls(CONFIG_DIR / "pedidosya_urls.txt")
+    if not urls:
+        raise RuntimeError("Creá config/pedidosya_urls.txt con la URL de cada categoría/pasillo de "
+                           "PedidosYa Market Belgrano (una por línea).")
+    filas = {}
+    with sync_playwright() as pw:
+        browser, ctx = _nuevo_contexto(pw, "PedidosYa Market Belgrano", HEADLESS)
+        try:
+            page = ctx.new_page()
+            cap = _Captura(page, "PedidosYa Market Belgrano")
+            for url in urls:
+                categoria = re.sub(r"[-_]+", " ", url.rstrip("/").split("/")[-1].split("?")[0]).title()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                _esperar(page, scrolls=1)
+                sin_crecer = 0
+                for _ in range(PY_MAX_SCROLLS):            # scroll infinito
+                    antes = len(filas)
+                    for p in cap.vaciar(categoria):
+                        filas[p["ean"]] = p
+                    sin_crecer = sin_crecer + 1 if len(filas) == antes else 0
+                    if sin_crecer >= 4:
+                        break
+                    page.mouse.wheel(0, 4000)
+                    page.wait_for_timeout(900)
+                log.info("PedidosYa: %s -> %d productos acumulados", categoria, len(filas))
+        finally:
+            ctx.close()
+            browser.close()
+    if not filas:
+        raise RuntimeError("No capturé ningún producto de PedidosYa (con EAN y precio). "
+                           "Corré `python scraper.py --solo \"PedidosYa Market Belgrano\" --debug --visible`")
+    if _SIN_EAN["n"]:
+        log.warning("PedidosYa: %d objetos con nombre y precio pero sin EAN fueron ignorados", _SIN_EAN["n"])
+    return pd.DataFrame(list(filas.values()))
+
+
+def guardar_sesion(tienda):
+    """Abre un navegador visible para que elijas sucursal (Coto) o dirección (PedidosYa) y guarda la sesión."""
+    from playwright.sync_api import sync_playwright
+    urls = _leer_urls(CONFIG_DIR / "pedidosya_urls.txt")
+    inicio = {"Coto": COTO_HOME}.get(tienda, urls[0] if urls else "https://www.pedidosya.com.ar/")
+    STATE_DIR.mkdir(exist_ok=True)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=False)
+        ctx = browser.new_context(locale="es-AR", timezone_id="America/Argentina/Buenos_Aires", user_agent=UA)
+        ctx.new_page().goto(inicio)
+        input(f"[{tienda}] Elegí la sucursal/dirección en el navegador y apretá Enter acá para guardar... ")
+        ctx.storage_state(path=str(STATE_DIR / f"{tienda}.json"))
+        browser.close()
+    print("Sesión guardada.")
+
+
+def _con_respaldo(fn, tienda):
+    def run():
+        try:
+            return fn()
+        except Exception as e:
+            try:
+                log.warning("%s: falló el scraping web (%s); uso el CSV de respaldo", tienda, e)
+                return importar_csv(tienda)
+            except FileNotFoundError:
+                raise e
+    return run
 
 
 ADAPTADORES = {
     "Carrefour": lambda: descargar_vtex("https://www.carrefour.com.ar"),
     "Dia": lambda: descargar_vtex("https://diaonline.supermercadosdia.com.ar"),
-    "Coto": descargar_coto,
-    "PedidosYa Market Belgrano": descargar_pedidosya,
+    "Coto": _con_respaldo(descargar_coto, "Coto"),
+    "PedidosYa Market Belgrano": _con_respaldo(descargar_pedidosya, "PedidosYa Market Belgrano"),
 }
 
 
@@ -281,8 +499,6 @@ ADAPTADORES = {
 # SNAPSHOT SEMANAL
 # ==============================================================================
 def _limpiar(df):
-    if df.empty:
-        return df
     df = df.copy()
     df["ean"] = df["ean"].astype(str).str.strip()
     df["precio"] = pd.to_numeric(df["precio"], errors="coerce")
@@ -292,7 +508,8 @@ def _limpiar(df):
     return df.drop_duplicates(subset="ean")
 
 
-def tomar_snapshot(forzar=False):
+def tomar_snapshot(forzar=False, solo=None):
+    """Toma el snapshot de cada tienda que lo necesite. Devuelve {tienda: mensaje}."""
     if not _LOCK.acquire(blocking=False):
         return {"info": "Ya hay un snapshot en curso"}
     resumen = {}
@@ -301,19 +518,25 @@ def tomar_snapshot(forzar=False):
         con = conectar()
         try:
             for tienda, descargar in ADAPTADORES.items():
+                if solo and tienda != solo:
+                    continue
                 ultima = _ultima_fecha(con, tienda)
                 if (not forzar) and ultima and (hoy - date.fromisoformat(ultima)).days < INTERVALO_DIAS:
-                    resumen[tienda] = f"omitida (último snapshot: {ultima})"
+                    resumen[tienda] = f"omitida (ultimo snapshot: {ultima})"
                     continue
                 try:
                     df = _limpiar(descargar())
-                except Exception as e:
+                except Exception as e:  # una tienda caida no frena a las demas
                     log.exception("Fallo %s", tienda)
                     resumen[tienda] = f"ERROR: {e}"
                     continue
                 if df.empty:
-                    resumen[tienda] = "sin productos"
+                    resumen[tienda] = "sin productos (no se guardo nada)"
                     continue
+                previo = _cantidad(con, tienda, ultima) if ultima else 0
+                if previo and len(df) < 0.5 * previo:
+                    log.warning("%s: %d productos vs %d del snapshot anterior (posible descarga incompleta)",
+                                tienda, len(df), previo)
                 _guardar(con, tienda, hoy.isoformat(), df)
                 resumen[tienda] = f"OK: {len(df):,} productos"
         finally:
@@ -324,17 +547,16 @@ def tomar_snapshot(forzar=False):
 
 
 def estado_snapshots():
+    """Resumen por tienda: ultimo snapshot, cantidad de snapshots y de productos."""
     con = conectar()
     try:
         a = pd.read_sql_query(
             "SELECT tienda, MAX(fecha) AS ultimo, COUNT(DISTINCT fecha) AS snapshots "
-            "FROM precios GROUP BY tienda", con
-        )
+            "FROM precios GROUP BY tienda", con)
         b = pd.read_sql_query(
             "SELECT p.tienda, COUNT(*) AS productos FROM precios p "
             "JOIN (SELECT tienda, MAX(fecha) AS f FROM precios GROUP BY tienda) m "
-            "ON p.tienda=m.tienda AND p.fecha=m.f GROUP BY p.tienda", con
-        )
+            "ON p.tienda=m.tienda AND p.fecha=m.f GROUP BY p.tienda", con)
     finally:
         con.close()
     out = pd.DataFrame({"tienda": list(ADAPTADORES)}).merge(a, how="left", on="tienda").merge(b, how="left", on="tienda")
@@ -348,7 +570,21 @@ def estado_snapshots():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--forzar", action="store_true", help="ignora el intervalo de 7 días")
+    ap.add_argument("--forzar", action="store_true", help="ignora el intervalo de 7 dias")
+    ap.add_argument("--solo", help="procesa solo esta tienda (nombre exacto)")
+    ap.add_argument("--debug", action="store_true", help="vuelca las respuestas JSON a debug/")
+    ap.add_argument("--visible", action="store_true", help="muestra el navegador")
+    ap.add_argument("--login", metavar="TIENDA", help="guarda sesion (sucursal/direccion) de Coto o PedidosYa")
+    ap.add_argument("--daemon", action="store_true", help="loop permanente, revisa cada 6 h")
     args = ap.parse_args()
-    for t, msg in tomar_snapshot(forzar=args.forzar).items():
-        print(f"{t}: {msg}")
+    DEBUG, HEADLESS = args.debug, not args.visible
+    if args.login:
+        guardar_sesion(args.login)
+    elif args.daemon:
+        while True:
+            for t, msg in tomar_snapshot().items():
+                log.info("%s: %s", t, msg)
+            time.sleep(6 * 3600)
+    else:
+        for t, msg in tomar_snapshot(forzar=args.forzar, solo=args.solo).items():
+            print(f"{t}: {msg}")
