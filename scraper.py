@@ -16,11 +16,12 @@ snapshot tiene menos de 7 dias.
 import argparse
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -29,12 +30,23 @@ import requests
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "precios.db"
 MANUAL_DIR = BASE_DIR / "manual"      # CSVs de respaldo: manual/<Tienda>.csv
-INTERVALO_DIAS = 7
+INTERVALO_DIAS = int(os.environ.get("INTERVALO_DIAS", 7))   # poné 1 para snapshots diarios
+REINTENTO_HORAS = 6                   # si una tienda falla, no reintenta antes de esto
+ESTADO_PATH = BASE_DIR / "estado_corridas.json"
+LOCK_PATH = BASE_DIR / "snapshot.lock"
 PAUSA_ENTRE_REQUESTS = 0.3            # segundos, para no saturar los servidores
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MonitorPrecios/1.0)"}
 
 log = logging.getLogger("scraper")
 _LOCK = threading.Lock()
+
+
+def _latido():
+    """Marca que la descarga sigue viva (el lock se considera huérfano si pasan 30 min sin latido)."""
+    try:
+        LOCK_PATH.touch()
+    except OSError:
+        pass
 
 
 # ==============================================================================
@@ -142,6 +154,7 @@ def descargar_vtex(base):
     hojas = _categorias_vtex(base)
     truncadas, fallidas = [], 0
     for i, (cat_id, cat_top) in enumerate(hojas, 1):
+        _latido()
         desde = 0
         while True:
             lote = _get_json(
@@ -397,6 +410,7 @@ def descargar_coto():
             for i, (url, nombre) in enumerate(categorias, 1):
                 anterior = set()
                 for n in range(1, COTO_MAX_PAGINAS + 1):
+                    _latido()
                     page.goto(f"{url}?page={n}", wait_until="domcontentloaded", timeout=60000)
                     _esperar(page)
                     prods = cap.vaciar(nombre)
@@ -438,6 +452,7 @@ def descargar_pedidosya():
                 _esperar(page, scrolls=1)
                 sin_crecer = 0
                 for _ in range(PY_MAX_SCROLLS):            # scroll infinito
+                    _latido()
                     antes = len(filas)
                     for p in cap.vaciar(categoria):
                         filas[p["ean"]] = p
@@ -496,7 +511,7 @@ ADAPTADORES = {
 
 
 # ==============================================================================
-# SNAPSHOT SEMANAL
+# SNAPSHOT SEMANAL (con estado visible, lock entre procesos y reintentos espaciados)
 # ==============================================================================
 def _limpiar(df):
     df = df.copy()
@@ -508,46 +523,112 @@ def _limpiar(df):
     return df.drop_duplicates(subset="ean")
 
 
+def _leer_estado():
+    try:
+        return json.loads(ESTADO_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _set_estado(tienda, ok, mensaje):
+    est = _leer_estado()
+    est[tienda] = {"intento": datetime.now().isoformat(timespec="seconds"), "ok": ok, "mensaje": mensaje}
+    ESTADO_PATH.write_text(json.dumps(est, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def hay_descarga_en_curso():
+    try:
+        return time.time() - LOCK_PATH.stat().st_mtime < 30 * 60
+    except FileNotFoundError:
+        return False
+
+
+def _tomar_lock():
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        if hay_descarga_en_curso():
+            return False
+        LOCK_PATH.unlink(missing_ok=True)       # lock huérfano (proceso muerto)
+        return _tomar_lock()
+
+
+def _debe_correr(con, tienda, forzar):
+    if forzar:
+        return True
+    ultima = _ultima_fecha(con, tienda)
+    if ultima and (date.today() - date.fromisoformat(ultima)).days < INTERVALO_DIAS:
+        return False
+    est = _leer_estado().get(tienda)
+    if est and est.get("ok") is False:
+        try:
+            if datetime.now() - datetime.fromisoformat(est["intento"]) < timedelta(hours=REINTENTO_HORAS):
+                return False
+        except (KeyError, ValueError):
+            pass
+    return True
+
+
+def tiendas_pendientes():
+    """Tiendas que necesitan snapshot ahora (sin datos, vencidas, y no fallaron hace poco)."""
+    con = conectar()
+    try:
+        return [t for t in ADAPTADORES if _debe_correr(con, t, False)]
+    finally:
+        con.close()
+
+
 def tomar_snapshot(forzar=False, solo=None):
     """Toma el snapshot de cada tienda que lo necesite. Devuelve {tienda: mensaje}."""
     if not _LOCK.acquire(blocking=False):
         return {"info": "Ya hay un snapshot en curso"}
+    if not _tomar_lock():
+        _LOCK.release()
+        return {"info": "Ya hay una descarga en curso en otro proceso"}
     resumen = {}
+    con = None
     try:
         hoy = date.today()
         con = conectar()
-        try:
-            for tienda, descargar in ADAPTADORES.items():
-                if solo and tienda != solo:
-                    continue
-                ultima = _ultima_fecha(con, tienda)
-                if (not forzar) and ultima and (hoy - date.fromisoformat(ultima)).days < INTERVALO_DIAS:
-                    resumen[tienda] = f"omitida (ultimo snapshot: {ultima})"
-                    continue
-                try:
-                    df = _limpiar(descargar())
-                except Exception as e:  # una tienda caida no frena a las demas
-                    log.exception("Fallo %s", tienda)
-                    resumen[tienda] = f"ERROR: {e}"
-                    continue
-                if df.empty:
-                    resumen[tienda] = "sin productos (no se guardo nada)"
-                    continue
-                previo = _cantidad(con, tienda, ultima) if ultima else 0
-                if previo and len(df) < 0.5 * previo:
-                    log.warning("%s: %d productos vs %d del snapshot anterior (posible descarga incompleta)",
-                                tienda, len(df), previo)
-                _guardar(con, tienda, hoy.isoformat(), df)
-                resumen[tienda] = f"OK: {len(df):,} productos"
-        finally:
-            con.close()
+        for tienda, descargar in ADAPTADORES.items():
+            if solo and tienda != solo:
+                continue
+            if not _debe_correr(con, tienda, forzar):
+                resumen[tienda] = "omitida (al día o reintento reciente)"
+                continue
+            _set_estado(tienda, None, "descargando...")
+            try:
+                df = _limpiar(descargar())
+            except Exception as e:  # una tienda caida no frena a las demas
+                log.exception("Fallo %s", tienda)
+                _set_estado(tienda, False, str(e)[:300])
+                resumen[tienda] = f"ERROR: {e}"
+                continue
+            if df.empty:
+                _set_estado(tienda, False, "la descarga no devolvió productos")
+                resumen[tienda] = "sin productos (no se guardo nada)"
+                continue
+            ultima = _ultima_fecha(con, tienda)
+            previo = _cantidad(con, tienda, ultima) if ultima else 0
+            if previo and len(df) < 0.5 * previo:
+                log.warning("%s: %d productos vs %d del snapshot anterior (posible descarga incompleta)",
+                            tienda, len(df), previo)
+            _guardar(con, tienda, hoy.isoformat(), df)
+            _set_estado(tienda, True, f"{len(df):,} productos")
+            resumen[tienda] = f"OK: {len(df):,} productos"
     finally:
+        if con:
+            con.close()
+        LOCK_PATH.unlink(missing_ok=True)
         _LOCK.release()
     return resumen
 
 
 def estado_snapshots():
-    """Resumen por tienda: ultimo snapshot, cantidad de snapshots y de productos."""
+    """Resumen por tienda: ultimo snapshot, cantidad de snapshots/productos y resultado del ultimo intento."""
     con = conectar()
     try:
         a = pd.read_sql_query(
@@ -560,7 +641,17 @@ def estado_snapshots():
     finally:
         con.close()
     out = pd.DataFrame({"tienda": list(ADAPTADORES)}).merge(a, how="left", on="tienda").merge(b, how="left", on="tienda")
-    out.columns = ["Tienda", "Último snapshot", "Snapshots", "Productos"]
+    est = _leer_estado()
+
+    def texto(t):
+        e = est.get(t)
+        if not e:
+            return "—"
+        icono = "⏳" if e["ok"] is None else ("✅" if e["ok"] else "❌")
+        return f"{icono} {e['mensaje']}"
+
+    out["estado"] = out["tienda"].map(texto)
+    out.columns = ["Tienda", "Último snapshot", "Snapshots", "Productos", "Último intento"]
     out["Último snapshot"] = out["Último snapshot"].fillna("—")
     out["Snapshots"] = out["Snapshots"].fillna(0).astype(int)
     out["Productos"] = out["Productos"].fillna(0).astype(int)
@@ -586,5 +677,5 @@ if __name__ == "__main__":
                 log.info("%s: %s", t, msg)
             time.sleep(6 * 3600)
     else:
-        for t, msg in tomar_snapshot(forzar=args.forzar, solo=args.solo).items():
+        for t, msg in tomar_snapshot(forzar=args.forzar or bool(args.solo), solo=args.solo).items():
             print(f"{t}: {msg}")
