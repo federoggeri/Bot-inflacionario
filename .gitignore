@@ -1,0 +1,10 @@
+precios.db
+precios.db-wal
+precios.db-shm
+snapshot.lock
+scraper.log
+debug/
+estado_sesion/
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
