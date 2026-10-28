@@ -3,6 +3,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
+import requests
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -147,9 +149,13 @@ def lanzar_scraper(forzar=False):
         return
     cmd = [sys.executable, str(SCRAPER_PY)] + (["--forzar"] if forzar else [])
     kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
-    with open(SCRAPER_PY.parent / "scraper.log", "ab") as salida:
-        subprocess.Popen(cmd, cwd=str(SCRAPER_PY.parent), stdout=salida, stderr=subprocess.STDOUT, **kw)
-    st.session_state["_lanzado_ts"] = pd.Timestamp.now()
+    try:
+        with open(SCRAPER_PY.parent / "scraper.log", "ab") as salida:
+            subprocess.Popen(cmd, cwd=str(SCRAPER_PY.parent), stdout=salida, stderr=subprocess.STDOUT, **kw)
+        st.session_state["_lanzado_ts"] = pd.Timestamp.now()
+    except Exception as e:
+        st.session_state["_lanzado_ts"] = pd.Timestamp.now()
+        st.error(f"No pude iniciar scraper.py: {type(e).__name__}: {e}")
 
 
 def descarga_automatica():
@@ -161,7 +167,12 @@ def descarga_automatica():
         lanzar_scraper()
 
 
-@st.fragment(run_every=15)
+def _fragmento(fn):
+    frag = getattr(st, "fragment", None)      # Streamlit >= 1.37
+    return frag(run_every=15)(fn) if frag else fn
+
+
+@_fragmento
 def panel_estado():
     estado = scraper.estado_snapshots()
     st.dataframe(estado, hide_index=True)
@@ -176,24 +187,131 @@ def panel_estado():
         st.rerun()
 
 
-descarga_automatica()
+# --- Modo nube: la descarga la hace un workflow de GitHub Actions y los datos viven en el repo ---
+def _secreto(nombre):
+    try:
+        return st.secrets.get(nombre)
+    except Exception:
+        return None
+
+
+GH_REPO, GH_TOKEN = _secreto("GITHUB_REPO"), _secreto("GITHUB_TOKEN")
+GH_BRANCH = _secreto("GITHUB_BRANCH") or "main"
+MODO_NUBE = bool(GH_REPO and GH_TOKEN)
+WORKFLOW = "scrape.yml"
+
+
+def _gh(metodo, ruta, **kw):
+    return requests.request(
+        metodo, f"https://api.github.com/repos/{GH_REPO}{ruta}", timeout=20,
+        headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"}, **kw)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def ultima_corrida() -> dict:
+    try:
+        r = _gh("GET", f"/actions/workflows/{WORKFLOW}/runs", params={"per_page": 1})
+        if r.status_code != 200:
+            return {"error": f"GitHub respondió {r.status_code}: {r.text[:150]}"}
+        corridas = r.json().get("workflow_runs", [])
+        return corridas[0] if corridas else {}
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
+
+def corrida_en_curso(run: dict) -> bool:
+    return run.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
+
+
+def disparar_workflow(forzar=False):
+    try:
+        r = _gh("POST", f"/actions/workflows/{WORKFLOW}/dispatches",
+                json={"ref": GH_BRANCH, "inputs": {"forzar": "true" if forzar else "false"}})
+    except requests.RequestException as e:
+        return False, str(e)
+    ultima_corrida.clear()
+    if r.status_code == 204:
+        return True, "Descarga pedida a GitHub Actions."
+    return False, f"GitHub respondió {r.status_code}: {r.text[:200]}"
+
+
+def descarga_automatica_nube():
+    """Al abrir la app: si faltan datos y no hay corrida reciente, pide una descarga a GitHub Actions."""
+    if st.session_state.get("_disparo_auto"):
+        return
+    st.session_state["_disparo_auto"] = True
+    if not scraper.tiendas_pendientes():
+        return
+    run = ultima_corrida()
+    if run.get("error") or corrida_en_curso(run):
+        return
+    if run.get("created_at"):
+        antiguedad = pd.Timestamp.now(tz="UTC") - pd.Timestamp(run["created_at"])
+        if antiguedad < pd.Timedelta(hours=scraper.REINTENTO_HORAS):
+            return
+    disparar_workflow(False)
+
+
+@st.cache_resource(ttl=600, show_spinner=False)
+def _sincronizar():
+    return scraper.sincronizar_desde_datos()      # reconstruye la base local desde datos/*.csv.gz
+
+
+@_fragmento
+def panel_estado_nube():
+    st.dataframe(scraper.estado_snapshots(), hide_index=True)
+    run = ultima_corrida()
+    if run.get("error"):
+        st.error(f"No pude consultar GitHub: {run['error']}")
+    elif not run:
+        st.caption("Todavía no hubo corridas del workflow.")
+    elif corrida_en_curso(run):
+        st.info(f"⏳ GitHub Actions está descargando precios. [Ver progreso]({run['html_url']})")
+    else:
+        icono = "✅" if run.get("conclusion") == "success" else "❌"
+        st.caption(f"{icono} Última corrida: {run.get('conclusion')} — "
+                   f"{pd.Timestamp(run['created_at']).tz_convert('America/Argentina/Buenos_Aires'):%d/%m %H:%M} "
+                   f"([detalle]({run['html_url']}))")
+        st.caption("Si terminó hace poco, la app se actualiza sola en 1–2 minutos: recargá la página.")
+
+
+_sincronizar()
 
 with st.sidebar:
     st.header("🗓️ Estado de los precios")
-    st.caption(f"Se toma un snapshot por cadena cada {scraper.INTERVALO_DIAS} día(s), automáticamente al abrir la app "
-               "(y también por la tarea programada, si la configuraste).")
-    panel_estado()
-    if st.button("🔄 Forzar actualización ahora"):
-        lanzar_scraper(forzar=True)
-        st.toast("Descarga iniciada en segundo plano", icon="⏳")
-    st.caption("Detalles técnicos en `scraper.log`.")
+    if MODO_NUBE:
+        descarga_automatica_nube()
+        st.caption("Los precios los baja GitHub Actions (cada lunes y cuando faltan datos) y se guardan en el "
+                   "repositorio; esta app los lee.")
+        panel_estado_nube()
+        if st.button("🔄 Forzar actualización ahora"):
+            ok, msg = disparar_workflow(forzar=True)
+            (st.toast if ok else st.error)(msg)
+    else:
+        descarga_automatica()
+        st.caption(f"Se toma un snapshot por cadena cada {scraper.INTERVALO_DIAS} día(s), automáticamente al abrir la app "
+                   "(y también por la tarea programada, si la configuraste).")
+        panel_estado()
+        if st.button("🔄 Forzar actualización ahora"):
+            lanzar_scraper(forzar=True)
+            st.toast("Descarga iniciada en segundo plano", icon="⏳")
+        with st.expander("Ver log del scraper"):
+            ruta_log = SCRAPER_PY.parent / "scraper.log"
+            if ruta_log.exists():
+                st.code("\n".join(ruta_log.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]) or "(vacío)")
+            else:
+                st.caption("Todavía no hay log.")
 
 df_cat = cargar_catalogo()
 
 st.title("🛒 Monitor de Inflación Personal & Comparador de Precios")
 
 if df_cat.empty:
-    if scraper.hay_descarga_en_curso():
+    if MODO_NUBE:
+        st.info("⏳ Todavía no hay precios guardados. Se pidió la primera descarga a GitHub Actions (puede tardar "
+                "bastante). Mirá el estado en la barra lateral y recargá la página cuando termine.")
+    elif scraper.hay_descarga_en_curso():
         st.info("⏳ Estoy descargando los precios por primera vez. La primera cadena puede tardar varios minutos; "
                 "esta página se completa sola apenas haya datos.")
     else:
@@ -246,9 +364,15 @@ with tab1:
         vista = sub_df[["producto", "marca", "categoria", "ean", "precio_min", "cadenas"]].rename(columns={
             "producto": "Producto", "marca": "Marca", "categoria": "Categoría",
             "ean": "EAN", "precio_min": "Precio mín. ($)", "cadenas": "Cadenas"})
-        evento = st.dataframe(vista, hide_index=True, height=320,
-                              on_select="rerun", selection_mode="multi-row", key="tabla_busqueda")
-        filas_sel = evento.selection.rows
+        try:
+            evento = st.dataframe(vista, hide_index=True, height=320,
+                                  on_select="rerun", selection_mode="multi-row", key="tabla_busqueda")
+            filas_sel = list(evento.selection.rows)
+        except TypeError:      # Streamlit viejo (< 1.35): sin selección en tablas
+            st.dataframe(vista.head(300), hide_index=True, height=320)
+            filas_sel = st.multiselect(
+                "Elegí productos (primeros 300 resultados):", options=list(range(min(len(sub_df), 300))),
+                format_func=lambda i: f"{sub_df.loc[i, 'producto']} — {sub_df.loc[i, 'marca']}")
         c_cant, c_btn = st.columns([1, 1])
         with c_cant:
             cant_elegida = st.number_input("Cantidad mensual (q₀):", min_value=1.0, value=2.0, step=1.0)

@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -31,8 +32,11 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "precios.db"
 MANUAL_DIR = BASE_DIR / "manual"      # CSVs de respaldo: manual/<Tienda>.csv
 INTERVALO_DIAS = int(os.environ.get("INTERVALO_DIAS", 7))   # poné 1 para snapshots diarios
+VTEX_HILOS = int(os.environ.get("VTEX_HILOS", 6))         # categorias en paralelo por tienda VTEX
+PARALELO = os.environ.get("PARALELO", "1") != "0"        # las 4 tiendas a la vez (PARALELO=0 -> una por una)
 REINTENTO_HORAS = 6                   # si una tienda falla, no reintenta antes de esto
-ESTADO_PATH = BASE_DIR / "estado_corridas.json"
+DATOS_DIR = BASE_DIR / "datos"                  # snapshots .csv.gz + estado (esto es lo que se sube a git)
+ESTADO_PATH = DATOS_DIR / "estado_corridas.json"
 LOCK_PATH = BASE_DIR / "snapshot.lock"
 PAUSA_ENTRE_REQUESTS = 0.3            # segundos, para no saturar los servidores
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MonitorPrecios/1.0)"}
@@ -44,7 +48,8 @@ _LOCK = threading.Lock()
 def _latido():
     """Marca que la descarga sigue viva (el lock se considera huérfano si pasan 30 min sin latido)."""
     try:
-        LOCK_PATH.touch()
+        if LOCK_PATH.exists():          # nunca crear el lock: solo renovarlo
+            os.utime(LOCK_PATH)
     except OSError:
         pass
 
@@ -101,18 +106,23 @@ def _guardar(con, tienda, fecha, df):
 # ==============================================================================
 # ADAPTADOR VTEX (Carrefour y Dia)
 # ==============================================================================
+_ULTIMO_HTTP = {"detalle": "sin respuesta"}
+
+
 def _get_json(url, params=None, reintentos=4):
-    """Devuelve el JSON, o None si fallo tras los reintentos."""
+    """Devuelve el JSON, o None si fallo tras los reintentos (el motivo queda en _ULTIMO_HTTP)."""
     for i in range(reintentos):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=30)
             if r.status_code in (200, 206):
                 return r.json()
+            _ULTIMO_HTTP["detalle"] = f"HTTP {r.status_code} en {url}"
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 * (i + 1))
                 continue
             return None
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as e:
+            _ULTIMO_HTTP["detalle"] = f"{type(e).__name__}: {e} en {url}"
             time.sleep(1 + i)
     return None
 
@@ -121,7 +131,7 @@ def _categorias_vtex(base):
     """Devuelve [(id_categoria_hoja, nombre_categoria_principal)]."""
     arbol = _get_json(f"{base}/api/catalog_system/pub/category/tree/3")
     if not arbol:
-        raise RuntimeError(f"No pude leer el arbol de categorias de {base}")
+        raise RuntimeError(f"No pude leer el árbol de categorías de {base} ({_ULTIMO_HTTP['detalle']})")
     hojas = []
 
     def rec(nodo, top):
@@ -145,56 +155,63 @@ def _precio_disponible(item):
     return None
 
 
+def _descargar_categoria(base, cat_id, cat_top):
+    """Baja todos los productos de una categoría hoja. Devuelve (filas, truncada, fallo)."""
+    filas, desde = {}, 0
+    while True:
+        _latido()
+        lote = _get_json(
+            f"{base}/api/catalog_system/pub/products/search",
+            params={"fq": f"C:{cat_id}", "_from": desde, "_to": desde + 49},
+        )
+        if lote is None:
+            return filas, False, True
+        if not lote:
+            return filas, False, False
+        for p in lote:
+            for it in p.get("items", []):
+                ean = (it.get("ean") or "").strip()
+                if not ean:
+                    continue
+                precio = _precio_disponible(it)
+                if precio is None:
+                    continue
+                filas[ean] = {"ean": ean, "producto": p.get("productName", ""), "marca": p.get("brand", ""),
+                              "categoria": cat_top, "precio": precio}
+        if len(lote) < 50:
+            return filas, False, False
+        desde += 50
+        if desde >= 2500:                    # tope de VTEX por consulta
+            return filas, True, False
+        time.sleep(PAUSA_ENTRE_REQUESTS)
+
+
 def descargar_vtex(base):
     """
-    VTEX devuelve 50 productos por request y no permite pasar de ~2500 por
-    consulta. Por eso se recorre categoria por categoria (hojas del arbol).
+    VTEX devuelve 50 productos por request y no permite pasar de ~2500 por consulta, por eso
+    se recorre categoría por categoría (hojas del árbol), varias en paralelo.
     """
-    filas = {}
     hojas = _categorias_vtex(base)
-    truncadas, fallidas = [], 0
-    for i, (cat_id, cat_top) in enumerate(hojas, 1):
-        _latido()
-        desde = 0
-        while True:
-            lote = _get_json(
-                f"{base}/api/catalog_system/pub/products/search",
-                params={"fq": f"C:{cat_id}", "_from": desde, "_to": desde + 49},
-            )
-            if lote is None:
+    filas, truncadas, fallidas = {}, 0, 0
+    with ThreadPoolExecutor(max_workers=VTEX_HILOS) as ex:
+        futuros = [ex.submit(_descargar_categoria, base, cid, top) for cid, top in hojas]
+        for i, f in enumerate(as_completed(futuros), 1):
+            try:
+                fi, tr, fa = f.result()
+                filas.update(fi)
+                truncadas += tr
+                fallidas += fa
+            except Exception:
+                log.exception("Error procesando una categoría de %s", base)
                 fallidas += 1
-                break
-            if not lote:
-                break
-            for p in lote:
-                for it in p.get("items", []):
-                    ean = (it.get("ean") or "").strip()
-                    if not ean:
-                        continue
-                    precio = _precio_disponible(it)
-                    if precio is None:
-                        continue
-                    filas[ean] = {
-                        "ean": ean,
-                        "producto": p.get("productName", ""),
-                        "marca": p.get("brand", ""),
-                        "categoria": cat_top,
-                        "precio": precio,
-                    }
-            if len(lote) < 50:
-                break
-            desde += 50
-            if desde >= 2500:
-                truncadas.append(cat_id)
-                break
-            time.sleep(PAUSA_ENTRE_REQUESTS)
-        if i % 25 == 0:
-            log.info("%s: %d/%d categorias, %d productos", base, i, len(hojas), len(filas))
-        time.sleep(PAUSA_ENTRE_REQUESTS)
+            if i % 25 == 0:
+                log.info("%s: %d/%d categorías, %d productos", base, i, len(hojas), len(filas))
     if truncadas:
-        log.warning("%s: %d categorias llegaron al tope de 2500 y pueden estar incompletas", base, len(truncadas))
+        log.warning("%s: %d categorías llegaron al tope de 2500 y pueden estar incompletas", base, truncadas)
     if fallidas:
-        log.warning("%s: %d requests fallaron tras reintentos", base, fallidas)
+        log.warning("%s: %d categorías fallaron tras reintentos", base, fallidas)
+    if not filas:
+        raise RuntimeError(f"{base}: no se obtuvo ningún producto (último error: {_ULTIMO_HTTP['detalle']})")
     return pd.DataFrame(list(filas.values()))
 
 
@@ -397,8 +414,16 @@ def _categorias_coto(page):
     return list(resultado.items())
 
 
+def _requiere_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Falta Playwright. Instalalo con:  pip install playwright   y luego   playwright install chromium")
+    return sync_playwright
+
+
 def descargar_coto():
-    from playwright.sync_api import sync_playwright
+    sync_playwright = _requiere_playwright()
     filas = {}
     with sync_playwright() as pw:
         browser, ctx = _nuevo_contexto(pw, "Coto", HEADLESS)
@@ -435,7 +460,7 @@ def descargar_coto():
 
 
 def descargar_pedidosya():
-    from playwright.sync_api import sync_playwright
+    sync_playwright = _requiere_playwright()
     urls = _leer_urls(CONFIG_DIR / "pedidosya_urls.txt")
     if not urls:
         raise RuntimeError("Creá config/pedidosya_urls.txt con la URL de cada categoría/pasillo de "
@@ -523,6 +548,40 @@ def _limpiar(df):
     return df.drop_duplicates(subset="ean")
 
 
+def _slug(tienda):
+    return re.sub(r"\W+", "_", tienda)
+
+
+def exportar_snapshot(tienda, fecha, df):
+    """Guarda el snapshot como datos/AAAA-MM-DD__Tienda.csv.gz (así vive en el repositorio de git)."""
+    DATOS_DIR.mkdir(exist_ok=True)
+    ruta = DATOS_DIR / f"{fecha}__{_slug(tienda)}.csv.gz"
+    df[["ean", "producto", "marca", "categoria", "precio"]].to_csv(ruta, index=False, compression="gzip")
+
+
+def sincronizar_desde_datos():
+    """Carga en SQLite los snapshots de datos/*.csv.gz que todavía no estén en la base."""
+    if not DATOS_DIR.exists():
+        return 0
+    slugs = {_slug(t): t for t in ADAPTADORES}
+    con = conectar()
+    nuevos = 0
+    try:
+        existentes = {(f, t) for f, t in con.execute("SELECT DISTINCT fecha, tienda FROM precios")}
+        for ruta in sorted(DATOS_DIR.glob("*__*.csv.gz")):
+            fecha, _, resto = ruta.name.partition("__")
+            tienda = slugs.get(resto[: -len(".csv.gz")])
+            if not tienda or (fecha, tienda) in existentes:
+                continue
+            df = _limpiar(pd.read_csv(ruta, dtype={"ean": str}))
+            if not df.empty:
+                _guardar(con, tienda, fecha, df)
+                nuevos += 1
+    finally:
+        con.close()
+    return nuevos
+
+
 def _leer_estado():
     try:
         return json.loads(ESTADO_PATH.read_text(encoding="utf-8"))
@@ -530,10 +589,15 @@ def _leer_estado():
         return {}
 
 
+_ESTADO_LOCK = threading.Lock()
+
+
 def _set_estado(tienda, ok, mensaje):
-    est = _leer_estado()
-    est[tienda] = {"intento": datetime.now().isoformat(timespec="seconds"), "ok": ok, "mensaje": mensaje}
-    ESTADO_PATH.write_text(json.dumps(est, ensure_ascii=False, indent=1), encoding="utf-8")
+    with _ESTADO_LOCK:
+        DATOS_DIR.mkdir(exist_ok=True)
+        est = _leer_estado()
+        est[tienda] = {"intento": datetime.now().isoformat(timespec="seconds"), "ok": ok, "mensaje": mensaje}
+        ESTADO_PATH.write_text(json.dumps(est, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def hay_descarga_en_curso():
@@ -581,47 +645,61 @@ def tiendas_pendientes():
         con.close()
 
 
+def _procesar_tienda(tienda, descargar, forzar):
+    """Descarga y guarda una tienda (con su propia conexión SQLite). Devuelve un mensaje."""
+    con = conectar()
+    try:
+        if not _debe_correr(con, tienda, forzar):
+            return "omitida (al día o reintento reciente)"
+        _set_estado(tienda, None, "descargando...")
+        try:
+            df = _limpiar(descargar())
+        except Exception as e:  # una tienda caída no frena a las demás
+            log.exception("Fallo %s", tienda)
+            _set_estado(tienda, False, " ".join(str(e).split())[:300])
+            return f"ERROR: {e}"
+        if df.empty:
+            _set_estado(tienda, False, "la descarga no devolvió productos")
+            return "sin productos (no se guardó nada)"
+        ultima = _ultima_fecha(con, tienda)
+        previo = _cantidad(con, tienda, ultima) if ultima else 0
+        if previo and len(df) < 0.5 * previo:
+            log.warning("%s: %d productos vs %d del snapshot anterior (posible descarga incompleta)",
+                        tienda, len(df), previo)
+        hoy = date.today().isoformat()
+        _guardar(con, tienda, hoy, df)
+        exportar_snapshot(tienda, hoy, df)
+        _set_estado(tienda, True, f"{len(df):,} productos")
+        return f"OK: {len(df):,} productos"
+    finally:
+        con.close()
+
+
 def tomar_snapshot(forzar=False, solo=None):
-    """Toma el snapshot de cada tienda que lo necesite. Devuelve {tienda: mensaje}."""
+    """Toma el snapshot de cada tienda que lo necesite (en paralelo). Devuelve {tienda: mensaje}."""
     if not _LOCK.acquire(blocking=False):
         return {"info": "Ya hay un snapshot en curso"}
     if not _tomar_lock():
         _LOCK.release()
         return {"info": "Ya hay una descarga en curso en otro proceso"}
     resumen = {}
-    con = None
     try:
-        hoy = date.today()
-        con = conectar()
-        for tienda, descargar in ADAPTADORES.items():
-            if solo and tienda != solo:
-                continue
-            if not _debe_correr(con, tienda, forzar):
-                resumen[tienda] = "omitida (al día o reintento reciente)"
-                continue
-            _set_estado(tienda, None, "descargando...")
-            try:
-                df = _limpiar(descargar())
-            except Exception as e:  # una tienda caida no frena a las demas
-                log.exception("Fallo %s", tienda)
-                _set_estado(tienda, False, str(e)[:300])
-                resumen[tienda] = f"ERROR: {e}"
-                continue
-            if df.empty:
-                _set_estado(tienda, False, "la descarga no devolvió productos")
-                resumen[tienda] = "sin productos (no se guardo nada)"
-                continue
-            ultima = _ultima_fecha(con, tienda)
-            previo = _cantidad(con, tienda, ultima) if ultima else 0
-            if previo and len(df) < 0.5 * previo:
-                log.warning("%s: %d productos vs %d del snapshot anterior (posible descarga incompleta)",
-                            tienda, len(df), previo)
-            _guardar(con, tienda, hoy.isoformat(), df)
-            _set_estado(tienda, True, f"{len(df):,} productos")
-            resumen[tienda] = f"OK: {len(df):,} productos"
+        sincronizar_desde_datos()      # en una máquina nueva (ej. GitHub Actions) reconstruye la base desde datos/
+        tiendas = {t: f for t, f in ADAPTADORES.items() if not solo or t == solo}
+        if PARALELO and len(tiendas) > 1:
+            with ThreadPoolExecutor(max_workers=len(tiendas)) as ex:
+                futuros = {ex.submit(_procesar_tienda, t, f, forzar): t for t, f in tiendas.items()}
+                for fut in as_completed(futuros):
+                    t = futuros[fut]
+                    try:
+                        resumen[t] = fut.result()
+                    except Exception as e:
+                        _set_estado(t, False, " ".join(str(e).split())[:300])
+                        resumen[t] = f"ERROR: {e}"
+        else:
+            for t, f in tiendas.items():
+                resumen[t] = _procesar_tienda(t, f, forzar)
     finally:
-        if con:
-            con.close()
         LOCK_PATH.unlink(missing_ok=True)
         _LOCK.release()
     return resumen
