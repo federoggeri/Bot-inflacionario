@@ -22,10 +22,10 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 PESOS_TIENDA = {
-    "Dia": 0.955,                      # Estrategia descuento
+    "Dia": 0.955,                      # Hard discount
     "Coto": 0.988,                     # Hipermercado tradicional
     "Carrefour": 1.000,                # Media de mercado
-    "PedidosYa Market Belgrano": 1.155 # Prima de conveniencia en Belgrano
+    "PedidosYa Market Belgrano": 1.155 # Prima de conveniencia
 }
 
 # Serie oficial de IPC INDEC (Alimentos y Bebidas)
@@ -150,17 +150,23 @@ df_cat, df_mensual, df_diario = generar_base_completa()
 CATEGORIAS = ["Todas"] + sorted(df_cat["categoria"].unique().tolist())
 
 # ==============================================================================
-# 2. GESTIÓN DE SESIÓN
+# 2. GESTIÓN DE SESIÓN (PRECARGA SEGURA CONTRA INDEXERROR)
 # ==============================================================================
 if "canasta" not in st.session_state:
-    # Precarga inicial automática con productos habituales
-    st.session_state.canasta = {
-        df_cat[df_cat["producto"].str.contains("Leche Entera Clásica La Serenísima 1L")]["ean"].iloc[0]: 4.0,
-        df_cat[df_cat["producto"].str.contains("Dulce de Leche Colonial La Serenísima 400g")]["ean"].iloc[0]: 2.0,
-        df_cat[df_cat["producto"].str.contains("Fideos Spaghetti Lucchetti 500g")]["ean"].iloc[0]: 3.0,
-        df_cat[df_cat["producto"].str.contains("Aceite de Girasol Natura 1.5L")]["ean"].iloc[0]: 2.0,
-        df_cat[df_cat["producto"].str.contains("Yerba Mate Playadito con Palo 1kg")]["ean"].iloc[0]: 2.0,
-    }
+    st.session_state.canasta = {}
+    # Búsqueda segura: nunca falla con IndexError
+    filtros_iniciales = [
+        ("Leche", 4.0),
+        ("Dulce de Leche", 2.0),
+        ("Spaghetti", 3.0),
+        ("Girasol", 2.0),
+        ("Playadito", 2.0)
+    ]
+    for termino, cant in filtros_iniciales:
+        coincidencias = df_cat[df_cat["producto"].str.contains(termino, case=False, na=False)]
+        if not coincidencias.empty:
+            st.session_state.canasta[coincidencias["ean"].iloc[0]] = cant
+
 canasta = st.session_state.canasta
 
 st.title("🛒 Monitor de Inflación Personal & Comparador de Precios")
