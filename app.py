@@ -1,7 +1,7 @@
 """
 app.py
 Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
-Catálogo integral con selector de Alimento y Marca vs. Canasta Básica INDEC (CBA/CBT).
+Comparación contra Índices Oficiales de CABA (DGEyC) con selector de Alimento y Marca.
 """
 import unicodedata
 import requests
@@ -12,7 +12,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(
-    page_title="Monitor de Precios & Canasta Básica INDEC",
+    page_title="Monitor de Inflación vs. CABA",
     page_icon="🛒",
     layout="wide"
 )
@@ -20,22 +20,21 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 # ==============================================================================
-# 1. SERIES OFICIALES DEL INDEC: CANASTA BÁSICA (CBA Y CBT)
-# Fuente: Informes Técnicos INDEC - Valorización mensual de la canasta básica
+# 1. SERIES OFICIALES DGEyC - CABA (DATOS RELEVADOS POR EL USUARIO)
+# Fuente: Dirección General de Estadística y Censos de la Ciudad de Buenos Aires
 # ==============================================================================
-DATOS_INDEC = {
-    "Mayo 2026":       {"cba_var": 4.5, "cbt_var": 4.9, "ipc_alim_var": 4.8, "cba_pesos": 142500, "cbt_pesos": 315000},
-    "Junio 2026":      {"cba_var": 4.2, "cbt_var": 4.4, "ipc_alim_var": 4.4, "cba_pesos": 148485, "cbt_pesos": 328860},
-    "Julio 2026":      {"cba_var": 3.7, "cbt_var": 3.9, "ipc_alim_var": 3.8, "cba_pesos": 153978, "cbt_pesos": 341685},
-    "Agosto 2026":     {"cba_var": 3.4, "cbt_var": 3.7, "ipc_alim_var": 3.6, "cba_pesos": 159214, "cbt_pesos": 354327},
-    "Septiembre 2026": {"cba_var": 3.1, "cbt_var": 3.4, "ipc_alim_var": 3.3, "cba_pesos": 164150, "cbt_pesos": 366374},
-    "Octubre 2026":    {"cba_var": 2.9, "cbt_var": 3.1, "ipc_alim_var": 3.1, "cba_pesos": 168910, "cbt_pesos": 377732},
+DATOS_CABA = {
+    "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
+    "Junio 2026":      {"var_oficial": 1.6, "cba_pesos": 523646, "cbt_pesos": 994257},
+    "Julio 2026":      {"var_oficial": 1.9, "cba_pesos": 533595, "cbt_pesos": 1013148},
+    "Agosto 2026":     {"var_oficial": 2.1, "cba_pesos": 544800, "cbt_pesos": 1034424},
+    "Septiembre 2026": {"var_oficial": 2.1, "cba_pesos": 556241, "cbt_pesos": 1056147},
 }
 
-MESES_SERIE = list(DATOS_INDEC.keys())
+MESES_SERIE = list(DATOS_CABA.keys())
 
 # ==============================================================================
-# 2. GÓNDOLA INTEGRAL: ALIMENTOS, VARIEDADES Y TODAS LAS MARCAS ARGENTINAS
+# 2. GÓNDOLA INTEGRAL: ALIMENTOS, PRESENTACIONES Y MARCAS REALES
 # ==============================================================================
 MATRIZ_GONDOLA = [
     # --- LÁCTEOS Y QUESOS ---
@@ -261,8 +260,6 @@ def generar_base_de_datos():
             ean = f"779{c:010d}"
             c += 1
 
-            # Reglas específicas de precios por supermercado y marcas
-            # Calibración exacta: Leche Ilolay en Coto = $2.799
             if "Leche" in alimento and marca == "Ilolay":
                 p_coto = 2799.0
                 p_carr = 2850.0
@@ -291,7 +288,7 @@ def generar_base_de_datos():
     df_cat = pd.DataFrame(filas_catalogo)
     df_cat["busqueda"] = (df_cat["alimento"] + " " + df_cat["marca"] + " " + df_cat["ean"]).map(normalizar_texto)
 
-    # 1. Serie Mensual Histórica para Laspeyres vs Canasta Básica
+    # 1. Serie Mensual Histórica alineada con el período provisto
     mensuales = []
     tienda_col_map = {
         "Coto": "p_coto",
@@ -300,8 +297,9 @@ def generar_base_de_datos():
         "PedidosYa Market Belgrano": "p_pya"
     }
 
+    n_meses = len(MESES_SERIE)
     for idx_m, mes in enumerate(MESES_SERIE):
-        factor_inflacion = (1 + 0.034) ** (idx_m - 5)
+        factor_inflacion = (1 + 0.021) ** (idx_m - (n_meses - 1))
         for _, row in df_cat.iterrows():
             for tienda, col in tienda_col_map.items():
                 p_actual = row[col]
@@ -321,7 +319,7 @@ def generar_base_de_datos():
     # 2. Serie Diaria Intrames
     diarios = []
     for dia in range(1, 31):
-        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.030
+        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.021
         efecto_promo = 0.98 if dia % 7 in [3, 4] else 1.00
         for _, row in df_cat.iterrows():
             for tienda, col in tienda_col_map.items():
@@ -461,7 +459,6 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
 # ==============================================================================
 if "canasta" not in st.session_state:
     st.session_state.canasta = {}
-    # Precarga inicial con Leche Ilolay y esenciales
     items_default = [
         df_cat[(df_cat["alimento"] == "Leche Entera Larga Vida 1L") & (df_cat["marca"] == "Ilolay")]["ean"].iloc[0],
         df_cat[(df_cat["alimento"] == "Dulce de Leche Colonial / Especial 400g") & (df_cat["marca"] == "La Serenísima Colonial")]["ean"].iloc[0],
@@ -474,12 +471,12 @@ if "canasta" not in st.session_state:
 
 canasta = st.session_state.canasta
 
-st.title("🛒 Monitor de Inflación Personal vs. Canasta Básica INDEC")
-st.caption(f"Base de datos activa: **{len(df_cat):,} productos con marcas reales** | Comercios: {', '.join(TIENDAS)}")
+st.title("🛒 Monitor de Inflación Personal vs. Índices CABA")
+st.caption(f"Medición econométrica contra CABA | Base activa: **{len(df_cat):,} combinaciones de alimentos y marcas** | Comercios: {', '.join(TIENDAS)}")
 
 tab1, tab2, tab3 = st.tabs([
     "🧺 1. Armar y Editar Canasta (Alimento y Marca)",
-    "📈 2. Tu Inflación Personal vs. Canasta Básica INDEC",
+    "📈 2. Tu Inflación Personal vs. Índices CABA",
     "🎯 3. Optimizador de Faltantes (Ofertas y Precios en Vivo)",
 ])
 
@@ -490,7 +487,6 @@ with tab1:
     st.subheader("1. Selección de Alimentos y Marcas")
     st.write("Elegí el producto y seleccioná la **Marca** específica que consumís en tu hogar:")
 
-    # Filtros de exploración
     c_f_cat, c_f_marca, c_f_txt = st.columns([1.2, 1.2, 2])
     with c_f_cat:
         cat_filtro = st.selectbox("Filtrar por Categoría:", CATEGORIAS)
@@ -547,8 +543,6 @@ with tab1:
             canasta[ean_item] = cant_elegida
             st.toast(f"Sumado: {alimento_elegido} ({marca_elegida})", icon="✅")
 
-    # Módulo de alta de producto si alguien busca algo ultra específico
-    st.markdown("---")
     with st.expander("✨ ¿Buscás un alimento o marca que no figura arriba? Agregalo en el acto"):
         c_n_nom, c_n_mar, c_n_pr, c_n_add = st.columns([2, 1.5, 1, 1])
         with c_n_nom:
@@ -613,78 +607,48 @@ with tab1:
         st.info("Tu canasta está vacía. Seleccioná un alimento y marca arriba para comenzar a medir.")
 
 # ==============================================================================
-# PESTAÑA 2: INFLACIÓN PERSONAL VS. CANASTA BÁSICA INDEC (CBA / CBT)
+# PESTAÑA 2: INFLACIÓN PERSONAL VS. ÍNDICES CABA (DGEyC)
 # ==============================================================================
 with tab2:
-    st.subheader("2. Medición Econométrica: Tu Inflación vs. Canasta Básica INDEC")
+    st.subheader("2. Medición Econométrica: Tu Inflación vs. Referencia Oficial CABA")
     if not canasta:
         st.warning("Primero agregá productos a tu canasta en la Pestaña 1.")
     else:
-        c_bench, _ = st.columns([2.8, 1.2])
-        with c_bench:
-            tipo_canasta = st.radio(
-                "Canasta oficial de referencia (INDEC):",
-                [
-                    "CBA: Canasta Básica Alimentaria (Línea de Indigencia)",
-                    "CBT: Canasta Básica Total (Línea de Pobreza)",
-                    "IPC Alimentos y Bebidas (Consumo General)"
-                ],
-                horizontal=True
-            )
-
-        if "CBA" in tipo_canasta:
-            clave_var = "cba_var"
-            clave_pesos = "cba_pesos"
-            sigla = "CBA"
-            nombre_oficial = "Canasta Básica Alimentaria (Requerimientos Calóricos Mínimos)"
-        elif "CBT" in tipo_canasta:
-            clave_var = "cbt_var"
-            clave_pesos = "cbt_pesos"
-            sigla = "CBT"
-            nombre_oficial = "Canasta Básica Total (Alimentos + Servicios Básicos)"
-        else:
-            clave_var = "ipc_alim_var"
-            clave_pesos = None
-            sigla = "IPC Alimentos"
-            nombre_oficial = "IPC División Alimentos y Bebidas no alcohólicas"
-
         sub_m = df_mensual[df_mensual["ean"].isin(canasta.keys())].copy()
         sub_m["q0"] = sub_m["ean"].map(canasta)
         sub_m["gasto_item"] = sub_m["precio"] * sub_m["q0"]
 
         costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
         costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
-        costo_mes["var_indec_%"] = costo_mes["mes"].apply(lambda m: DATOS_INDEC[m][clave_var])
+        costo_mes["var_caba_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
 
         gasto_inicio = costo_mes.iloc[0]["gasto_item"]
         gasto_fin = costo_mes.iloc[-1]["gasto_item"]
         inf_acum_personal = ((gasto_fin - gasto_inicio) / gasto_inicio) * 100
 
-        factor_indec = 1.0
+        # Acumulado oficial CABA de los meses posteriores al base
+        factor_caba = 1.0
         for m in MESES_SERIE[1:]:
-            factor_indec *= (1 + DATOS_INDEC[m][clave_var] / 100.0)
-        inf_acum_indec = (factor_indec - 1.0) * 100
+            factor_caba *= (1 + DATOS_CABA[m]["var_oficial"] / 100.0)
+        inf_acum_caba = (factor_caba - 1.0) * 100
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tu Inflación Acumulada", f"{inf_acum_personal:.2f}%")
-        m2.metric(f"Avance Acumulado {sigla}", f"{inf_acum_indec:.2f}%")
-        brecha = inf_acum_personal - inf_acum_indec
+        m2.metric("Inflación CABA Acumulada", f"{inf_acum_caba:.2f}%")
+        brecha = inf_acum_personal - inf_acum_caba
         m3.metric(
-            f"Brecha vs. {sigla}",
+            "Brecha vs. CABA",
             f"{brecha:+.2f} p.p.",
-            delta=f"{'Mayor presión' if brecha > 0 else 'Menor presión'} que la línea oficial",
+            delta=f"{'Mayor impacto' if brecha > 0 else 'Menor impacto'} en tu canasta",
             delta_color="inverse"
         )
-        if clave_pesos:
-            m4.metric(f"Costo {sigla} Hogar (Octubre)", f"${DATOS_INDEC['Octubre 2026'][clave_pesos]:,}")
-        else:
-            m4.metric("Ponderador Alimentos en IPC", "23.4%")
+        m4.metric("Último dato mensual (Septiembre)", f"{DATOS_CABA['Septiembre 2026']['var_oficial']:.1f}%")
 
         st.divider()
 
         # Gráfico 1: Variación mensual comparativa
-        st.markdown(f"### 📊 Gráfico 1: Variación Mensual: Tu Canasta vs. {sigla} INDEC (%)")
-        st.caption(f"Compara mes a mes el aumento porcentual de tu consumo frente al avance de la {nombre_oficial}:")
+        st.markdown("### 📊 Gráfico 1: Variación Mensual: Tu Canasta vs. CABA (%)")
+        st.caption("Comparación mes a mes con tus datos oficiales (Mayo 2.8%, Junio 1.6%, Julio 1.9%, Agosto 2.1%, Septiembre 2.1%):")
         df_graf_m = costo_mes.iloc[1:].copy()
         fmt = lambda x: f"{x:.2f}%"
 
@@ -695,13 +659,13 @@ with tab2:
             text=df_graf_m["inflacion_personal_%"].map(fmt), textposition="outside"
         ))
         fig_comp.add_trace(go.Bar(
-            x=df_graf_m["mes"], y=df_graf_m["var_indec_%"],
-            name=f"Variación {sigla} INDEC", marker_color="#ff7f0e",
-            text=df_graf_m["var_indec_%"].map(fmt), textposition="outside"
+            x=df_graf_m["mes"], y=df_graf_m["var_caba_%"],
+            name="Oficial CABA (DGEyC)", marker_color="#ff7f0e",
+            text=df_graf_m["var_caba_%"].map(fmt), textposition="outside"
         ))
         fig_comp.update_layout(
             barmode="group",
-            title=f"Variación Mensual Período a Período vs. {sigla} (%)",
+            title="Variación Mensual Período a Período vs. CABA (%)",
             xaxis_title="Mes", yaxis_title="Tasa Mensual (%)", yaxis_ticksuffix="%",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
@@ -710,12 +674,12 @@ with tab2:
         st.divider()
 
         # Gráfico 2: Trayectoria Base 100
-        st.markdown(f"### 📈 Gráfico 2: Trayectoria Acumulada del Nivel de Precios (Base Mayo 2026 = 100)")
+        st.markdown("### 📈 Gráfico 2: Trayectoria Acumulada del Nivel de Precios (Base Mayo 2026 = 100)")
         costo_mes["indice_personal"] = (costo_mes["gasto_item"] / gasto_inicio) * 100
-        idx_indec = [100.0]
+        idx_caba = [100.0]
         for m in MESES_SERIE[1:]:
-            idx_indec.append(idx_indec[-1] * (1 + DATOS_INDEC[m][clave_var] / 100.0))
-        costo_mes["indice_indec"] = idx_indec
+            idx_caba.append(idx_caba[-1] * (1 + DATOS_CABA[m]["var_oficial"] / 100.0))
+        costo_mes["indice_caba"] = idx_caba
 
         fig_idx = go.Figure()
         fig_idx.add_trace(go.Scatter(
@@ -723,11 +687,11 @@ with tab2:
             name="Índice Personal (Canasta Propia)", line=dict(color="#1f77b4", width=3)
         ))
         fig_idx.add_trace(go.Scatter(
-            x=costo_mes["mes"], y=costo_mes["indice_indec"], mode="lines+markers",
-            name=f"Índice Oficial {sigla} INDEC", line=dict(color="#ff7f0e", width=3, dash="dash")
+            x=costo_mes["mes"], y=costo_mes["indice_caba"], mode="lines+markers",
+            name="Índice Oficial CABA (DGEyC)", line=dict(color="#ff7f0e", width=3, dash="dash")
         ))
         fig_idx.update_layout(
-            title=f"Evolución Acumulada del Costo de Vida vs. {sigla} (Base Mayo = 100)",
+            title="Evolución Acumulada del Nivel de Precios (Base Mayo 2026 = 100)",
             xaxis_title="Mes", yaxis_title="Puntos de Índice",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
