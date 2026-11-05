@@ -1,7 +1,7 @@
 """
 app.py
 Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
-Comparación contra Índices Oficiales de CABA (DGEyC) con selector de Alimento y Marca.
+Comparación contra Índices CABA (DGEyC) y API Oficial INDEC (con token seguro en st.secrets).
 """
 import unicodedata
 import requests
@@ -12,7 +12,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(
-    page_title="Monitor de Inflación vs. CABA",
+    page_title="Monitor de Inflación vs. CABA / INDEC",
     page_icon="🛒",
     layout="wide"
 )
@@ -20,8 +20,7 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 # ==============================================================================
-# 1. SERIES OFICIALES DGEyC - CABA (DATOS RELEVADOS POR EL USUARIO)
-# Fuente: Dirección General de Estadística y Censos de la Ciudad de Buenos Aires
+# 1. SERIES DE CABA (DGEyC) Y CONEXIÓN DEFENSIVA A LA API DEL INDEC
 # ==============================================================================
 DATOS_CABA = {
     "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
@@ -32,6 +31,49 @@ DATOS_CABA = {
 }
 
 MESES_SERIE = list(DATOS_CABA.keys())
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def consultar_api_indec() -> dict:
+    """
+    Consulta la API oficial de series de tiempo del INDEC usando el token de st.secrets.
+    Si la API no responde o no hay token configurado, retorna la serie de respaldo.
+    """
+    token = st.secrets.get("INDEC_API_TOKEN", None)
+    headers = {"User-Agent": "MonitorPrecios/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-API-KEY"] = token
+
+    # Endpoint oficial de series de tiempo (IPC Nacional Alimentos)
+    url = "https://apis.datos.gob.ar/series/api/series/"
+    params = {
+        "ids": "145.3_INGNACNAL_DICI_M_15", # Serie oficial IPC Alimentos
+        "limit": 6,
+        "sort": "desc"
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=3.5)
+        if r.status_code == 200:
+            data = r.json()
+            filas = data.get("data", [])
+            if filas:
+                # Retorna diccionario procesado con las variaciones mensuales
+                resultado_api = {}
+                for f in reversed(filas):
+                    fecha_str, val = f[0], f[1]
+                    mes_nombre = pd.to_datetime(fecha_str).strftime("%B %Y").capitalize()
+                    resultado_api[mes_nombre] = float(val)
+                return {"origen": "🟢 API Oficial INDEC (Conectada en vivo)", "datos": resultado_api}
+    except Exception:
+        pass
+
+    return {
+        "origen": "🟡 Serie CABA DGEyC (Respaldo activo)",
+        "datos": {m: DATOS_CABA[m]["var_oficial"] for m in MESES_SERIE}
+    }
+
+api_indec_info = consultar_api_indec()
 
 # ==============================================================================
 # 2. GÓNDOLA INTEGRAL: ALIMENTOS, PRESENTACIONES Y MARCAS REALES
@@ -471,12 +513,12 @@ if "canasta" not in st.session_state:
 
 canasta = st.session_state.canasta
 
-st.title("🛒 Monitor de Inflación Personal vs. Índices CABA")
-st.caption(f"Medición econométrica contra CABA | Base activa: **{len(df_cat):,} combinaciones de alimentos y marcas** | Comercios: {', '.join(TIENDAS)}")
+st.title("🛒 Monitor de Inflación Personal vs. Benchmarks Oficiales")
+st.caption(f"Comparación econométrica | Base activa: **{len(df_cat):,} combinaciones de alimentos y marcas** | Comercios: {', '.join(TIENDAS)}")
 
 tab1, tab2, tab3 = st.tabs([
     "🧺 1. Armar y Editar Canasta (Alimento y Marca)",
-    "📈 2. Tu Inflación Personal vs. Índices CABA",
+    "📈 2. Tu Inflación Personal vs. Índices CABA / INDEC",
     "🎯 3. Optimizador de Faltantes (Ofertas y Precios en Vivo)",
 ])
 
@@ -607,48 +649,67 @@ with tab1:
         st.info("Tu canasta está vacía. Seleccioná un alimento y marca arriba para comenzar a medir.")
 
 # ==============================================================================
-# PESTAÑA 2: INFLACIÓN PERSONAL VS. ÍNDICES CABA (DGEyC)
+# PESTAÑA 2: INFLACIÓN PERSONAL VS. ÍNDICES CABA / INDEC
 # ==============================================================================
 with tab2:
-    st.subheader("2. Medición Econométrica: Tu Inflación vs. Referencia Oficial CABA")
+    st.subheader("2. Medición Econométrica: Tu Inflación vs. Referencias Oficiales")
     if not canasta:
         st.warning("Primero agregá productos a tu canasta en la Pestaña 1.")
     else:
+        # Selector de referencia oficial
+        c_bench, c_origen = st.columns([2.5, 1.5])
+        with c_bench:
+            fuente_elegida = st.radio(
+                "Benchmark a comparar:",
+                ["CABA (DGEyC - Serie del Usuario)", "INDEC Oficial (API en Vivo)"],
+                horizontal=True
+            )
+        with c_origen:
+            st.caption(f"**Estado de conexión:**\n{api_indec_info['origen']}")
+
         sub_m = df_mensual[df_mensual["ean"].isin(canasta.keys())].copy()
         sub_m["q0"] = sub_m["ean"].map(canasta)
         sub_m["gasto_item"] = sub_m["precio"] * sub_m["q0"]
 
         costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
         costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
-        costo_mes["var_caba_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
+
+        # Asignar serie oficial según selección
+        if "CABA" in fuente_elegida:
+            costo_mes["var_oficial_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
+            nombre_serie = "Oficial CABA (DGEyC)"
+        else:
+            # Datos provistos por la API del INDEC (con fallback a la serie local)
+            costo_mes["var_oficial_%"] = costo_mes["mes"].apply(
+                lambda m: api_indec_info["datos"].get(m, DATOS_CABA[m]["var_oficial"])
+            )
+            nombre_serie = "API Oficial INDEC"
 
         gasto_inicio = costo_mes.iloc[0]["gasto_item"]
         gasto_fin = costo_mes.iloc[-1]["gasto_item"]
         inf_acum_personal = ((gasto_fin - gasto_inicio) / gasto_inicio) * 100
 
-        # Acumulado oficial CABA de los meses posteriores al base
-        factor_caba = 1.0
-        for m in MESES_SERIE[1:]:
-            factor_caba *= (1 + DATOS_CABA[m]["var_oficial"] / 100.0)
-        inf_acum_caba = (factor_caba - 1.0) * 100
+        factor_oficial = 1.0
+        for v in costo_mes["var_oficial_%"].iloc[1:]:
+            factor_oficial *= (1 + v / 100.0)
+        inf_acum_oficial = (factor_oficial - 1.0) * 100
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tu Inflación Acumulada", f"{inf_acum_personal:.2f}%")
-        m2.metric("Inflación CABA Acumulada", f"{inf_acum_caba:.2f}%")
-        brecha = inf_acum_personal - inf_acum_caba
+        m2.metric(f"Inflación Acumulada ({nombre_serie})", f"{inf_acum_oficial:.2f}%")
+        brecha = inf_acum_personal - inf_acum_oficial
         m3.metric(
-            "Brecha vs. CABA",
+            "Brecha",
             f"{brecha:+.2f} p.p.",
             delta=f"{'Mayor impacto' if brecha > 0 else 'Menor impacto'} en tu canasta",
             delta_color="inverse"
         )
-        m4.metric("Último dato mensual (Septiembre)", f"{DATOS_CABA['Septiembre 2026']['var_oficial']:.1f}%")
+        m4.metric("Último mes (Septiembre)", f"{costo_mes['var_oficial_%'].iloc[-1]:.1f}%")
 
         st.divider()
 
         # Gráfico 1: Variación mensual comparativa
-        st.markdown("### 📊 Gráfico 1: Variación Mensual: Tu Canasta vs. CABA (%)")
-        st.caption("Comparación mes a mes con tus datos oficiales (Mayo 2.8%, Junio 1.6%, Julio 1.9%, Agosto 2.1%, Septiembre 2.1%):")
+        st.markdown(f"### 📊 Gráfico 1: Variación Mensual: Tu Canasta vs. {nombre_serie} (%)")
         df_graf_m = costo_mes.iloc[1:].copy()
         fmt = lambda x: f"{x:.2f}%"
 
@@ -659,13 +720,13 @@ with tab2:
             text=df_graf_m["inflacion_personal_%"].map(fmt), textposition="outside"
         ))
         fig_comp.add_trace(go.Bar(
-            x=df_graf_m["mes"], y=df_graf_m["var_caba_%"],
-            name="Oficial CABA (DGEyC)", marker_color="#ff7f0e",
-            text=df_graf_m["var_caba_%"].map(fmt), textposition="outside"
+            x=df_graf_m["mes"], y=df_graf_m["var_oficial_%"],
+            name=nombre_serie, marker_color="#ff7f0e",
+            text=df_graf_m["var_oficial_%"].map(fmt), textposition="outside"
         ))
         fig_comp.update_layout(
             barmode="group",
-            title="Variación Mensual Período a Período vs. CABA (%)",
+            title=f"Variación Mensual: Canasta Personal vs. {nombre_serie} (%)",
             xaxis_title="Mes", yaxis_title="Tasa Mensual (%)", yaxis_ticksuffix="%",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
@@ -676,10 +737,10 @@ with tab2:
         # Gráfico 2: Trayectoria Base 100
         st.markdown("### 📈 Gráfico 2: Trayectoria Acumulada del Nivel de Precios (Base Mayo 2026 = 100)")
         costo_mes["indice_personal"] = (costo_mes["gasto_item"] / gasto_inicio) * 100
-        idx_caba = [100.0]
-        for m in MESES_SERIE[1:]:
-            idx_caba.append(idx_caba[-1] * (1 + DATOS_CABA[m]["var_oficial"] / 100.0))
-        costo_mes["indice_caba"] = idx_caba
+        idx_oficial = [100.0]
+        for v in costo_mes["var_oficial_%"].iloc[1:]:
+            idx_oficial.append(idx_oficial[-1] * (1 + v / 100.0))
+        costo_mes["indice_oficial"] = idx_oficial
 
         fig_idx = go.Figure()
         fig_idx.add_trace(go.Scatter(
@@ -687,8 +748,8 @@ with tab2:
             name="Índice Personal (Canasta Propia)", line=dict(color="#1f77b4", width=3)
         ))
         fig_idx.add_trace(go.Scatter(
-            x=costo_mes["mes"], y=costo_mes["indice_caba"], mode="lines+markers",
-            name="Índice Oficial CABA (DGEyC)", line=dict(color="#ff7f0e", width=3, dash="dash")
+            x=costo_mes["mes"], y=costo_mes["indice_oficial"], mode="lines+markers",
+            name=f"Índice {nombre_serie}", line=dict(color="#ff7f0e", width=3, dash="dash")
         ))
         fig_idx.update_layout(
             title="Evolución Acumulada del Nivel de Precios (Base Mayo 2026 = 100)",
