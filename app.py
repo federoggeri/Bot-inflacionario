@@ -1,7 +1,7 @@
 """
 app.py
 Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
-Catálogo masivo (>5.000 productos), benchmark oficial CABA (Agosto 1.8%) vs API INDEC en Vivo
+Catálogo masivo (>5.000 productos), benchmark oficial CABA (Agosto 1.8%) vs API INDEC Alimentos en Vivo
 y motor de Scraping en Vivo para el optimizador de faltantes.
 """
 import unicodedata
@@ -21,7 +21,7 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 # ==============================================================================
-# 1. SERIES OFICIALES DGEyC CABA Y CONEXIÓN CORREGIDA A LA API DEL INDEC
+# 1. SERIES OFICIALES DGEyC CABA Y CONEXIÓN A LA API DE ALIMENTOS DEL INDEC
 # ==============================================================================
 DATOS_CABA = {
     "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
@@ -33,7 +33,7 @@ DATOS_CABA = {
 
 MESES_SERIE = list(DATOS_CABA.keys())
 
-# Serie nacional oficial del INDEC (diferenciada de CABA para respaldo offline)
+# Serie nacional oficial de Alimentos y Bebidas del INDEC (respaldo offline)
 DATOS_INDEC_FALLBACK = {
     "Mayo 2026": 4.8,
     "Junio 2026": 4.4,
@@ -55,7 +55,7 @@ MAPA_MESES = {
 def consultar_api_indec() -> dict:
     """
     Consulta la API oficial de series de tiempo del INDEC con el token configurado en st.secrets.
-    Mapea por número de mes para evitar desfasajes de idioma (en vs es) en servidores Cloud.
+    Apunta a la División 01: Alimentos y bebidas no alcohólicas (Nacional).
     """
     token = st.secrets.get("INDEC_API_TOKEN", None)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -65,8 +65,8 @@ def consultar_api_indec() -> dict:
 
     url = "https://apis.datos.gob.ar/series/api/series/"
     params = {
-        "ids": "145.3_INGNACNAL_DICI_M_15",       # Serie oficial IPC Alimentos Nacional
-        "representation_mode": "percent_change",  # Extrae la tasa porcentual mensual
+        "ids": "145.3_IALIMENNAL_DICI_M_31",      # Serie oficial IPC Alimentos y Bebidas (Nacional)
+        "representation_mode": "percent_change",  # Tasa mensual porcentual
         "limit": 8,
         "sort": "desc"
     }
@@ -80,16 +80,15 @@ def consultar_api_indec() -> dict:
                 fecha_str, val = f[0], f[1]
                 mes_num = fecha_str.split("-")[1]
                 if mes_num in MAPA_MESES and val is not None:
-                    # Convierte a formato porcentual si viene expresado en decimales
                     resultado_api[MAPA_MESES[mes_num]] = round(float(val) * 100, 2) if abs(val) < 1 else round(float(val), 2)
 
             if len(resultado_api) >= 3:
-                return {"origen": "🟢 API Oficial INDEC (Conectada en vivo)", "datos": resultado_api}
+                return {"origen": "🟢 API Oficial INDEC (Alimentos en Vivo)", "datos": resultado_api}
     except Exception:
         pass
 
     return {
-        "origen": "🟡 Serie Histórica INDEC Nacional (Respaldo offline)",
+        "origen": "🟡 Serie Histórica INDEC Alimentos (Respaldo offline)",
         "datos": DATOS_INDEC_FALLBACK
     }
 
@@ -668,7 +667,7 @@ with tab2:
         with c_bench:
             fuente_elegida = st.radio(
                 "Benchmark a comparar:",
-                ["CABA (DGEyC - Serie del Usuario)", "INDEC Oficial (API en Vivo)"],
+                ["CABA (DGEyC - Serie del Usuario)", "INDEC Oficial (API Alimentos en Vivo)"],
                 horizontal=True
             )
         with c_origen:
@@ -689,7 +688,7 @@ with tab2:
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(
                 lambda m: api_indec_info["datos"].get(m, DATOS_INDEC_FALLBACK[m])
             )
-            nombre_serie = "API Oficial INDEC"
+            nombre_serie = "API INDEC (Alimentos)"
 
         gasto_inicio = costo_mes.iloc[0]["gasto_item"]
         gasto_fin = costo_mes.iloc[-1]["gasto_item"]
