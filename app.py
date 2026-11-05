@@ -1,7 +1,7 @@
 """
 app.py
 Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
-Comparación contra Índices CABA (DGEyC) y API Oficial INDEC (con token seguro en st.secrets).
+Comparación contra Índices CABA (DGEyC) con selector Alimento ➔ Marca y catálogo extendido.
 """
 import unicodedata
 import requests
@@ -12,7 +12,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(
-    page_title="Monitor de Inflación vs. CABA / INDEC",
+    page_title="Monitor de Inflación vs. CABA",
     page_icon="🛒",
     layout="wide"
 )
@@ -20,45 +20,35 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 # ==============================================================================
-# 1. SERIES DE CABA (DGEyC) Y CONEXIÓN DEFENSIVA A LA API DEL INDEC
+# 1. SERIES OFICIALES DGEyC - CABA (AJUSTADO: AGOSTO 1.8%)
+# Fuente: Dirección General de Estadística y Censos de la Ciudad de Buenos Aires
 # ==============================================================================
 DATOS_CABA = {
     "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
     "Junio 2026":      {"var_oficial": 1.6, "cba_pesos": 523646, "cbt_pesos": 994257},
     "Julio 2026":      {"var_oficial": 1.9, "cba_pesos": 533595, "cbt_pesos": 1013148},
-    "Agosto 2026":     {"var_oficial": 2.1, "cba_pesos": 544800, "cbt_pesos": 1034424},
-    "Septiembre 2026": {"var_oficial": 2.1, "cba_pesos": 556241, "cbt_pesos": 1056147},
+    "Agosto 2026":     {"var_oficial": 1.8, "cba_pesos": 543200, "cbt_pesos": 1031385},
+    "Septiembre 2026": {"var_oficial": 2.1, "cba_pesos": 554607, "cbt_pesos": 1053044},
 }
 
 MESES_SERIE = list(DATOS_CABA.keys())
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def consultar_api_indec() -> dict:
-    """
-    Consulta la API oficial de series de tiempo del INDEC usando el token de st.secrets.
-    Si la API no responde o no hay token configurado, retorna la serie de respaldo.
-    """
     token = st.secrets.get("INDEC_API_TOKEN", None)
     headers = {"User-Agent": "MonitorPrecios/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["X-API-KEY"] = token
 
-    # Endpoint oficial de series de tiempo (IPC Nacional Alimentos)
     url = "https://apis.datos.gob.ar/series/api/series/"
-    params = {
-        "ids": "145.3_INGNACNAL_DICI_M_15", # Serie oficial IPC Alimentos
-        "limit": 6,
-        "sort": "desc"
-    }
-
+    params = {"ids": "145.3_INGNACNAL_DICI_M_15", "limit": 6, "sort": "desc"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=3.5)
         if r.status_code == 200:
             data = r.json()
             filas = data.get("data", [])
             if filas:
-                # Retorna diccionario procesado con las variaciones mensuales
                 resultado_api = {}
                 for f in reversed(filas):
                     fecha_str, val = f[0], f[1]
@@ -76,42 +66,144 @@ def consultar_api_indec() -> dict:
 api_indec_info = consultar_api_indec()
 
 # ==============================================================================
-# 2. GÓNDOLA INTEGRAL: ALIMENTOS, PRESENTACIONES Y MARCAS REALES
+# 2. GÓNDOLA INTEGRAL EXTENDIDA: VARIEDAD COMPLETA DE ALIMENTOS Y MARCAS
 # ==============================================================================
 MATRIZ_GONDOLA = [
-    # --- LÁCTEOS Y QUESOS ---
+    # --- LECHES Y LÁCTEOS LÍQUIDOS ---
     {"alimento": "Leche Entera Larga Vida 1L", "cat": "Lácteos y Frescos", "p_ref": 2850.0,
-     "marcas": ["Ilolay", "La Serenísima", "Sancor", "Tregar", "Las Tres Niñas", "Armonía", "Dia", "Carrefour"]},
+     "marcas": ["Ilolay", "La Serenísima Clásica", "Sancor", "Tregar", "Las Tres Niñas", "Armonía", "Dia", "Carrefour"]},
     {"alimento": "Leche Descremada Larga Vida 1L", "cat": "Lácteos y Frescos", "p_ref": 2850.0,
      "marcas": ["Ilolay", "La Serenísima", "Sancor", "Tregar", "Las Tres Niñas", "Dia", "Carrefour"]},
-    {"alimento": "Dulce de Leche Clásico 400g", "cat": "Lácteos y Frescos", "p_ref": 3450.0,
-     "marcas": ["La Serenísima", "San Ignacio", "Vacalin", "Ilolay", "Sancor", "Milkaut", "Dia", "Carrefour"]},
-    {"alimento": "Dulce de Leche Colonial / Especial 400g", "cat": "Lácteos y Frescos", "p_ref": 3650.0,
-     "marcas": ["La Serenísima Colonial", "Havanna Cartón 450g", "Chimbote 500g", "Poncho Negro"]},
-    {"alimento": "Manteca 200g", "cat": "Lácteos y Frescos", "p_ref": 3450.0,
-     "marcas": ["La Serenísima", "Sancor", "Ilolay", "Tregar", "Tonadita", "Dia", "Carrefour"]},
-    {"alimento": "Crema de Leche 200ml", "cat": "Lácteos y Frescos", "p_ref": 2690.0,
-     "marcas": ["La Serenísima", "Sancor", "Ilolay", "Milkaut", "Tregar"]},
-    {"alimento": "Queso Untable Clásico 290g", "cat": "Lácteos y Frescos", "p_ref": 3850.0,
-     "marcas": ["Finlandia", "Casancrem", "Mendicrim", "Tregar", "Ilolay", "Dia"]},
-    {"alimento": "Queso Untable Light 290g", "cat": "Lácteos y Frescos", "p_ref": 3850.0,
-     "marcas": ["Finlandia Light", "Casancrem Light", "Mendicrim 0%", "Tregar Light"]},
-    {"alimento": "Queso Cremoso x kg", "cat": "Lácteos y Frescos", "p_ref": 9850.0,
-     "marcas": ["La Paulina", "Punta del Agua", "Barraza", "Tregar", "La Serenísima", "Coto"]},
-    {"alimento": "Queso Por Salut x kg", "cat": "Lácteos y Frescos", "p_ref": 10500.0,
-     "marcas": ["La Serenísima", "La Paulina", "Tregar", "Punta del Agua"]},
-    {"alimento": "Queso Muzzarella x kg", "cat": "Lácteos y Frescos", "p_ref": 10200.0,
-     "marcas": ["Barraza", "La Paulina", "Punta del Agua", "Vidalac"]},
+    {"alimento": "Leche Deslactosada / Cero Lactosa 1L", "cat": "Lácteos y Frescos", "p_ref": 3250.0,
+     "marcas": ["La Serenísima Cero Lactosa", "Ilolay Sin Lactosa", "Tregar Cero Lactosa"]},
+    {"alimento": "Leche Fortificada con Hierro y Vitaminas 1L", "cat": "Lácteos y Frescos", "p_ref": 3100.0,
+     "marcas": ["La Serenísima Más Hierro", "Sancor Bebé 3", "Ilolay Kids"]},
+    {"alimento": "Leche Vegetal 1L", "cat": "Lácteos y Frescos", "p_ref": 3890.0,
+     "marcas": ["Silk Almendras", "Silk Coco", "Vrink Almendras Original", "La Serenísima 100% Vegetal", "Ades Soja"]},
+    {"alimento": "Leche en Polvo Entera 400g", "cat": "Lácteos y Frescos", "p_ref": 4890.0,
+     "marcas": ["La Serenísima", "Nido Fortigrow", "Sancor", "Ilolay"]},
     {"alimento": "Yogur Firme 190g", "cat": "Lácteos y Frescos", "p_ref": 1390.0,
      "marcas": ["Yogurísimo Vainilla", "Yogurísimo Frutilla", "Sancor Yogs", "Ilolay", "Tregar"]},
     {"alimento": "Yogur Bebible 1kg", "cat": "Lácteos y Frescos", "p_ref": 2950.0,
      "marcas": ["Yogurísimo Frutilla", "Yogurísimo Vainilla", "Ilolay", "Sancor Yogs", "Tregar"]},
+    {"alimento": "Yogur Griego 150g", "cat": "Lácteos y Frescos", "p_ref": 2450.0,
+     "marcas": ["Yogurísimo Estilo Griego", "Danone Natural", "Tregar Griego"]},
+    {"alimento": "Crema de Leche 200ml", "cat": "Lácteos y Frescos", "p_ref": 2690.0,
+     "marcas": ["La Serenísima", "Sancor", "Ilolay", "Milkaut", "Tregar"]},
+    {"alimento": "Manteca 200g", "cat": "Lácteos y Frescos", "p_ref": 3450.0,
+     "marcas": ["La Serenísima", "Sancor", "Ilolay", "Tregar", "Tonadita", "Dia", "Carrefour"]},
+    {"alimento": "Dulce de Leche Clásico 400g", "cat": "Lácteos y Frescos", "p_ref": 3450.0,
+     "marcas": ["La Serenísima", "San Ignacio", "Vacalin", "Ilolay", "Sancor", "Milkaut", "Dia", "Carrefour"]},
+    {"alimento": "Dulce de Leche Colonial / Especial 400g", "cat": "Lácteos y Frescos", "p_ref": 3650.0,
+     "marcas": ["La Serenísima Colonial", "Havanna Cartón 450g", "Chimbote 500g", "Poncho Negro"]},
+
+    # --- QUESOS ---
+    {"alimento": "Queso Cremoso x kg", "cat": "Lácteos y Frescos", "p_ref": 9850.0,
+     "marcas": ["La Paulina", "Punta del Agua", "Barraza", "Tregar", "La Serenísima", "Coto"]},
+    {"alimento": "Queso Cuartirolo x kg", "cat": "Lácteos y Frescos", "p_ref": 9950.0,
+     "marcas": ["La Serenísima", "La Paulina", "Tregar", "Punta del Agua"]},
+    {"alimento": "Queso Por Salut x kg", "cat": "Lácteos y Frescos", "p_ref": 10500.0,
+     "marcas": ["La Serenísima", "La Paulina", "Tregar", "Punta del Agua"]},
+    {"alimento": "Queso Por Salut Light / Sin Sal x kg", "cat": "Lácteos y Frescos", "p_ref": 10900.0,
+     "marcas": ["La Serenísima Sin Sal", "La Paulina Light", "Tregar Light"]},
+    {"alimento": "Queso Muzzarella x kg", "cat": "Lácteos y Frescos", "p_ref": 10200.0,
+     "marcas": ["Barraza", "La Paulina", "Punta del Agua", "Vidalac", "Coto"]},
+    {"alimento": "Queso Dambo / Tybo Feteado 200g", "cat": "Lácteos y Frescos", "p_ref": 3450.0,
+     "marcas": ["La Paulina", "Barraza", "Tregar", "Milkaut", "Dia", "Carrefour"]},
+    {"alimento": "Queso Gouda / Pategrás x kg", "cat": "Lácteos y Frescos", "p_ref": 13900.0,
+     "marcas": ["La Paulina", "Santa Rosa", "Tregar", "San Gotardo"]},
+    {"alimento": "Queso Rallado Sobre 150g", "cat": "Lácteos y Frescos", "p_ref": 3950.0,
+     "marcas": ["La Paulina", "Sancor", "Sardo La Serenísima", "Tregar"]},
+    {"alimento": "Queso Azul / Roquefort x kg", "cat": "Lácteos y Frescos", "p_ref": 14900.0,
+     "marcas": ["Santa Rosa", "Bavaria", "Ilolay"]},
+    {"alimento": "Queso Untable Clásico 290g", "cat": "Lácteos y Frescos", "p_ref": 3850.0,
+     "marcas": ["Finlandia", "Casancrem", "Mendicrim", "Tregar", "Ilolay", "Dia"]},
+    {"alimento": "Queso Untable Light 290g", "cat": "Lácteos y Frescos", "p_ref": 3850.0,
+     "marcas": ["Finlandia Light", "Casancrem Light", "Mendicrim 0%", "Tregar Light"]},
+    {"alimento": "Ricotta Entera 500g", "cat": "Lácteos y Frescos", "p_ref": 3150.0,
+     "marcas": ["Tregar", "La Paulina", "Barraza", "La Serenísima"]},
     {"alimento": "Huevos Blancos x12", "cat": "Lácteos y Frescos", "p_ref": 3790.0,
      "marcas": ["Granja Selección", "Maple Premium", "Coto", "Carrefour"]},
     {"alimento": "Huevos Colorados Maple x30", "cat": "Lácteos y Frescos", "p_ref": 8900.0,
      "marcas": ["Granja Selección", "Maple Avícola", "Coto"]},
 
-    # --- ALMACÉN ---
+    # --- GALLETITAS, BIZCOCHOS Y SNACKS ---
+    {"alimento": "Galletitas Chocolinas 250g", "cat": "Snacks y Galletitas", "p_ref": 2350.0,
+     "marcas": ["Bagley Chocolinas", "Chocolinas Cacao Intenso"]},
+    {"alimento": "Galletitas Oreo 118g", "cat": "Snacks y Galletitas", "p_ref": 1890.0,
+     "marcas": ["Oreo Clásica", "Oreo Golden", "Oreo Bañadas", "Oreo Chocolate"]},
+    {"alimento": "Galletitas Pepitos 119g", "cat": "Snacks y Galletitas", "p_ref": 1950.0,
+     "marcas": ["Pepitos Clásicas", "Pepitos Chispas Blancas", "Pepitos Rellenas"]},
+    {"alimento": "Galletitas Rellenas Clásicas 110g", "cat": "Snacks y Galletitas", "p_ref": 1490.0,
+     "marcas": ["Rumba", "Amor", "Mellizas", "Sonrisas Frambuesa", "Merengadas Frutilla"]},
+    {"alimento": "Galletitas Dulces Simples / Secas 300g", "cat": "Snacks y Galletitas", "p_ref": 1890.0,
+     "marcas": ["Maná Vainilla", "Vocación", "Coquitas", "Melba", "Paseo"]},
+    {"alimento": "Galletitas de Avena y Granola 250g", "cat": "Snacks y Galletitas", "p_ref": 2690.0,
+     "marcas": ["Frutigran Avena y Pasas", "Frutigran Chía", "Granix Frutos Rojos", "Quaker Avena"]},
+    {"alimento": "Galletitas de Agua Criollitas 3x100g", "cat": "Snacks y Galletitas", "p_ref": 2150.0,
+     "marcas": ["Criollitas Clásicas", "Criollitas Sin Sal", "Criollitas Lacteadas"]},
+    {"alimento": "Galletitas de Agua Express / Traviata 3x100g", "cat": "Snacks y Galletitas", "p_ref": 2150.0,
+     "marcas": ["Express Clásica", "Express Light", "Traviata", "Mediatarde"]},
+    {"alimento": "Galletitas Tipo Crackers Individuales", "cat": "Snacks y Galletitas", "p_ref": 1250.0,
+     "marcas": ["Club Social Original", "Club Social Queso", "Cereal Mix Original"]},
+    {"alimento": "Bizcochos Salados de Grasa 200g", "cat": "Snacks y Galletitas", "p_ref": 1390.0,
+     "marcas": ["Don Satur Salados", "Don Satur Agridulces", "Don Satur Negritos", "9 de Oro Salados", "9 de Oro Agridulces", "Jorgito"]},
+    {"alimento": "Papas Fritas Clásicas 85g", "cat": "Snacks y Galletitas", "p_ref": 2590.0,
+     "marcas": ["Lays Clásicas", "Pringles Original", "Pehuamar", "Krachitos", "Dia Tubo"]},
+    {"alimento": "Snacks de Queso 95g", "cat": "Snacks y Galletitas", "p_ref": 2490.0,
+     "marcas": ["Doritos Queso", "Cheetos", "Pehuamar Quesito"]},
+    {"alimento": "Alfajor de Chocolate x unidad", "cat": "Golosinas y Chocolates", "p_ref": 1950.0,
+     "marcas": ["Havanna 70% Cacao", "Havanna Mar del Plata", "Jorgito Chocolate", "Guaymallén Triple", "Capitán del Espacio", "Milka Oreo", "Cofler Block", "Águila"]},
+    {"alimento": "Chocolate con Leche 100g", "cat": "Golosinas y Chocolates", "p_ref": 3890.0,
+     "marcas": ["Milka Legítimo", "Cofler Aireado", "Cadbury Dairy Milk", "Shot Maní", "Águila Semi Amargo"]},
+
+    # --- PANES Y MASAS ---
+    {"alimento": "Pan de Mesa Blanco Lactal 500g", "cat": "Almacén", "p_ref": 3290.0,
+     "marcas": ["Bimbo Artesano", "Bimbo Clásico", "Fargo Blanco", "Lactal Blanco", "La Salteña"]},
+    {"alimento": "Pan Integral / Salvado 500g", "cat": "Almacén", "p_ref": 3450.0,
+     "marcas": ["Bimbo Doble Fibra", "Fargo Salvado", "Lactal Integral", "Bimbo Cero Cero"]},
+    {"alimento": "Pan para Panchos / Viena x6", "cat": "Almacén", "p_ref": 2190.0,
+     "marcas": ["Bimbo Pancho", "Fargo Viena", "Lactal Pancho", "Panadería Coto"]},
+    {"alimento": "Pan para Hamburguesas x4", "cat": "Almacén", "p_ref": 2490.0,
+     "marcas": ["Bimbo Artesano Hamburguesa", "Fargo con Sésamo", "Lactal Maxi", "Panadería Coto"]},
+    {"alimento": "Pan Árabe / Pita x4", "cat": "Almacén", "p_ref": 2150.0,
+     "marcas": ["Bimbo Árabe", "Fargo Pita", "Panadería Coto"]},
+    {"alimento": "Rapiditas / Tortillas de Trigo x10", "cat": "Almacén", "p_ref": 2890.0,
+     "marcas": ["Bimbo Rapiditas Clásicas", "Bimbo Rapiditas Light", "Fargo Tortillas", "La Salteña"]},
+
+    # --- SALSAS, TOMATES Y CONDIMENTOS ---
+    {"alimento": "Puré de Tomates Tetra 520g", "cat": "Almacén", "p_ref": 1150.0,
+     "marcas": ["Arcor", "La Campagnola", "Noel", "Marolio", "Salsati", "Dia", "Carrefour"]},
+    {"alimento": "Tomate Triturado Botella 950g", "cat": "Almacén", "p_ref": 2250.0,
+     "marcas": ["Arcor", "Marolio", "La Campagnola", "Mora"]},
+    {"alimento": "Salsa Lista Pomarola 340g", "cat": "Almacén", "p_ref": 1490.0,
+     "marcas": ["Knorr Pomarola", "Arcor Pomarola", "La Campagnola", "Salsati"]},
+    {"alimento": "Salsa Lista Filetto 340g", "cat": "Almacén", "p_ref": 1490.0,
+     "marcas": ["Knorr Filetto", "Arcor Filetto", "La Campagnola"]},
+    {"alimento": "Salsa Lista para Pizza 340g", "cat": "Almacén", "p_ref": 1450.0,
+     "marcas": ["Knorr Pizza", "Arcor Pizza", "Marolio"]},
+    {"alimento": "Salsa Pesto / Cuatro Quesos Frasco 190g", "cat": "Almacén", "p_ref": 3250.0,
+     "marcas": ["Knorr Pesto", "De Cecco Pesto Genovese", "La Campagnola"]},
+    {"alimento": "Mayonesa Doypack 500g", "cat": "Almacén", "p_ref": 2350.0,
+     "marcas": ["Natura", "Hellmann's Clásica", "Hellmann's Light", "Dánica", "Fanacoa", "Dia", "Carrefour"]},
+    {"alimento": "Mostaza 250g", "cat": "Almacén", "p_ref": 1650.0,
+     "marcas": ["Savora Clásica", "Savora Miel", "Hellmann's", "Natura", "Dánica"]},
+    {"alimento": "Kétchup Doypack 250g", "cat": "Almacén", "p_ref": 1890.0,
+     "marcas": ["Hellmann's", "Heinz", "Natura", "Dánica"]},
+    {"alimento": "Salsa Golf Doypack 250g", "cat": "Almacén", "p_ref": 1790.0,
+     "marcas": ["Natura", "Hellmann's", "Fanacoa"]},
+    {"alimento": "Salsa de Soja 250ml", "cat": "Almacén", "p_ref": 2150.0,
+     "marcas": ["Dos Anclas", "Menoyo", "Kikkoman"]},
+    {"alimento": "Aceto Balsámico 250ml", "cat": "Almacén", "p_ref": 2690.0,
+     "marcas": ["Menoyo", "Dos Anclas", "Casalta Clásico"]},
+    {"alimento": "Vinagre de Alcohol / Manzana 500ml", "cat": "Almacén", "p_ref": 1450.0,
+     "marcas": ["Menoyo", "Dos Anclas", "Coto", "Dia"]},
+    {"alimento": "Sal Fina 500g", "cat": "Almacén", "p_ref": 990.0,
+     "marcas": ["Dos Anclas", "Celusal", "Dia"]},
+    {"alimento": "Sal Gruesa / Parrillera 1kg", "cat": "Almacén", "p_ref": 1290.0,
+     "marcas": ["Dos Anclas", "Celusal", "Coto"]},
+
+    # --- FIDEOS, ARROZ Y ACEITES ---
     {"alimento": "Fideos Spaghetti 500g", "cat": "Almacén", "p_ref": 1850.0,
      "marcas": ["Lucchetti", "Matarazzo", "Terrabusi", "Knorr", "Favorita", "Marolio", "Dia", "Carrefour"]},
     {"alimento": "Fideos Tallarín 500g", "cat": "Almacén", "p_ref": 1850.0,
@@ -138,26 +230,10 @@ MATRIZ_GONDOLA = [
      "marcas": ["Blancaflor", "Pureza", "Cañuelas", "Morixe"]},
     {"alimento": "Azúcar Común Tipo A 1kg", "cat": "Almacén", "p_ref": 1390.0,
      "marcas": ["Ledesma", "Chango", "Dominó", "Marolio", "Dia", "Carrefour"]},
-    {"alimento": "Pan de Mesa Blanco 500g", "cat": "Almacén", "p_ref": 3290.0,
-     "marcas": ["Bimbo Artesano", "Bimbo Clásico", "Fargo", "Lactal", "La Salteña"]},
-    {"alimento": "Pan de Salvado 500g", "cat": "Almacén", "p_ref": 3450.0,
-     "marcas": ["Bimbo", "Fargo", "Lactal"]},
     {"alimento": "Atún en Lomitos al Natural 170g", "cat": "Almacén", "p_ref": 3990.0,
      "marcas": ["La Campagnola", "Gomes da Costa", "Robinson Crusoe", "Marolio", "Dia", "Carrefour"]},
-    {"alimento": "Mayonesa Doypack 500g", "cat": "Almacén", "p_ref": 2350.0,
-     "marcas": ["Natura", "Hellmann's", "Dánica", "Fanacoa", "Dia", "Carrefour"]},
-    {"alimento": "Kétchup Doypack 250g", "cat": "Almacén", "p_ref": 1890.0,
-     "marcas": ["Hellmann's", "Heinz", "Natura", "Dánica"]},
-    {"alimento": "Mostaza 250g", "cat": "Almacén", "p_ref": 1650.0,
-     "marcas": ["Savora Clásica", "Hellmann's", "Natura", "Dánica"]},
-    {"alimento": "Puré de Tomates Tetra 520g", "cat": "Almacén", "p_ref": 1150.0,
-     "marcas": ["Arcor", "La Campagnola", "Noel", "Marolio", "Salsati", "Dia", "Carrefour"]},
-    {"alimento": "Tomate Pelado Perita Lata 400g", "cat": "Almacén", "p_ref": 1450.0,
-     "marcas": ["Arcor", "La Campagnola", "Marolio", "Inalpa"]},
-    {"alimento": "Arvejas en Lata 300g", "cat": "Almacén", "p_ref": 950.0,
-     "marcas": ["Arcor", "La Campagnola", "Noel", "Marolio", "Dia", "Carrefour"]},
 
-    # --- DESAYUNO Y MERIENDA ---
+    # --- INFUSIONES Y DESAYUNO ---
     {"alimento": "Yerba Mate con Palo 1kg", "cat": "Almacén", "p_ref": 4990.0,
      "marcas": ["Playadito", "Rosamonte", "Taragüi", "La Merced", "Mañanita", "Cruz de Malta", "Amanda", "Unión", "CBSé"]},
     {"alimento": "Yerba Mate con Palo 500g", "cat": "Almacén", "p_ref": 2790.0,
@@ -170,102 +246,36 @@ MATRIZ_GONDOLA = [
      "marcas": ["Nescafé Dolca", "Nescafé Gold", "La Virginia Clásico", "Arlistán"]},
     {"alimento": "Té en Saquitos x50", "cat": "Almacén", "p_ref": 2190.0,
      "marcas": ["Taragüi", "La Virginia", "Green Hills", "Twinings", "Heredia"]},
-    {"alimento": "Cacao en Polvo 360g", "cat": "Almacén", "p_ref": 2890.0,
-     "marcas": ["Nesquik", "Chocolino", "Arcoa", "Zucoa"]},
-    {"alimento": "Edulcorante Líquido 250ml", "cat": "Almacén", "p_ref": 2490.0,
-     "marcas": ["Hileret Clásico", "Hileret Stevia", "Sucaryl", "Si Diet", "Chuker"]},
 
-    # --- CARNICERÍA Y GRANJA ---
+    # --- CARNES Y VERDULERÍA ---
     {"alimento": "Asado de Tira x kg", "cat": "Carnicería y Granja", "p_ref": 11890.0,
      "marcas": ["Novillito Selección Coto", "Corte Selección Carrefour", "Carne Vacuna Día", "Cabaña Las Lilas"]},
     {"alimento": "Vacío x kg", "cat": "Carnicería y Granja", "p_ref": 12900.0,
      "marcas": ["Novillito Selección Coto", "Corte Selección Carrefour", "Carne Vacuna Día"]},
-    {"alimento": "Bife de Chorizo x kg", "cat": "Carnicería y Granja", "p_ref": 13900.0,
-     "marcas": ["Novillito Selección Coto", "Corte Selección Carrefour", "Cabaña Las Lilas"]},
     {"alimento": "Nalga para Milanesas x kg", "cat": "Carnicería y Granja", "p_ref": 11490.0,
      "marcas": ["Novillito Coto", "Carrefour Selección", "Día"]},
-    {"alimento": "Peceto x kg", "cat": "Carnicería y Granja", "p_ref": 13200.0,
-     "marcas": ["Novillito Coto", "Carrefour Selección"]},
     {"alimento": "Carne Picada Especial x kg", "cat": "Carnicería y Granja", "p_ref": 7490.0,
      "marcas": ["Novillito Especial Coto", "Carrefour Picada Magra", "Día"]},
     {"alimento": "Pechuga de Pollo Fresca x kg", "cat": "Carnicería y Granja", "p_ref": 6890.0,
      "marcas": ["Granja Tres Arroyos", "Cresta Roja", "Pollo Selección Coto", "Carrefour"]},
     {"alimento": "Pata y Muslo de Pollo x kg", "cat": "Carnicería y Granja", "p_ref": 3890.0,
      "marcas": ["Granja Tres Arroyos", "Cresta Roja", "Coto", "Día"]},
-    {"alimento": "Milanesas de Pollo Rebozadas x kg", "cat": "Carnicería y Granja", "p_ref": 7800.0,
-     "marcas": ["Granja Tres Arroyos", "Granja del Sol", "Coto Elaboración Propia"]},
     {"alimento": "Hamburguesas Clásicas x4", "cat": "Carnicería y Granja", "p_ref": 4490.0,
      "marcas": ["Paty Clásica", "Swift", "Good Mark", "Barfy", "Día"]},
-    {"alimento": "Hamburguesas Clásicas x12", "cat": "Carnicería y Granja", "p_ref": 11900.0,
-     "marcas": ["Paty Pack x12", "Swift x12", "Good Mark x12"]},
-    {"alimento": "Salchichas de Viena x6", "cat": "Carnicería y Granja", "p_ref": 1990.0,
-     "marcas": ["Vieníssima", "Paladini", "Swift", "Patyviena", "Día"]},
-
-    # --- FRUTAS Y VERDURAS ---
     {"alimento": "Papa Negra Lavada x kg", "cat": "Frutas y Verduras", "p_ref": 1490.0,
      "marcas": ["Huerta Fresca Selección", "Coto", "Carrefour", "Día"]},
     {"alimento": "Cebolla Seleccionada x kg", "cat": "Frutas y Verduras", "p_ref": 1290.0,
      "marcas": ["Huerta Fresca", "Coto", "Carrefour", "Día"]},
     {"alimento": "Tomate Redondo x kg", "cat": "Frutas y Verduras", "p_ref": 2790.0,
      "marcas": ["Huerta Fresca Selección", "Coto", "Carrefour", "Día"]},
-    {"alimento": "Tomate Perita x kg", "cat": "Frutas y Verduras", "p_ref": 2650.0,
-     "marcas": ["Huerta Fresca", "Coto", "Carrefour"]},
-    {"alimento": "Zanahoria x kg", "cat": "Frutas y Verduras", "p_ref": 1390.0,
-     "marcas": ["Huerta Fresca", "Coto", "Carrefour", "Día"]},
-    {"alimento": "Lechuga Capuchina x kg", "cat": "Frutas y Verduras", "p_ref": 3200.0,
-     "marcas": ["Huerta Fresca", "Coto", "Carrefour"]},
-    {"alimento": "Morrón Rojo x kg", "cat": "Frutas y Verduras", "p_ref": 4800.0,
-     "marcas": ["Huerta Fresca", "Coto", "Carrefour"]},
-    {"alimento": "Palta Hass x unidad", "cat": "Frutas y Verduras", "p_ref": 1850.0,
-     "marcas": ["Selección Feria", "Coto", "Carrefour"]},
     {"alimento": "Banana Ecuador x kg", "cat": "Frutas y Verduras", "p_ref": 2690.0,
      "marcas": ["Huerta Fresca Importada", "Dole", "Coto", "Carrefour"]},
-    {"alimento": "Manzana Roja x kg", "cat": "Frutas y Verduras", "p_ref": 2490.0,
-     "marcas": ["Valle del Río Negro", "Coto", "Carrefour", "Día"]},
-    {"alimento": "Naranja de Jugo x kg", "cat": "Frutas y Verduras", "p_ref": 1690.0,
-     "marcas": ["Huerta Fresca", "Coto", "Carrefour", "Día"]},
-    {"alimento": "Limón x kg", "cat": "Frutas y Verduras", "p_ref": 1950.0,
-     "marcas": ["Tucumano Selección", "Coto", "Carrefour"]},
 
-    # --- SNACKS, GALLETITAS Y GOLOSINAS ---
-    {"alimento": "Galletitas Chocolinas 250g", "cat": "Snacks y Galletitas", "p_ref": 2350.0,
-     "marcas": ["Bagley Chocolinas", "Chocolinas Cacao Intenso"]},
-    {"alimento": "Galletitas Oreo 118g", "cat": "Snacks y Galletitas", "p_ref": 1890.0,
-     "marcas": ["Oreo Clásica", "Oreo Golden", "Oreo Bañadas"]},
-    {"alimento": "Galletitas Pepitos 119g", "cat": "Snacks y Galletitas", "p_ref": 1950.0,
-     "marcas": ["Pepitos Clásicas", "Pepitos Rellenas"]},
-    {"alimento": "Galletitas Criollitas 3x100g", "cat": "Snacks y Galletitas", "p_ref": 2150.0,
-     "marcas": ["Bagley Criollitas", "Traviata", "Express", "Mediatarde"]},
-    {"alimento": "Bizcochos Salados 200g", "cat": "Snacks y Galletitas", "p_ref": 1390.0,
-     "marcas": ["Don Satur Salados", "Don Satur Agridulces", "9 de Oro", "Jorgito", "Día"]},
-    {"alimento": "Papas Fritas Clásicas 85g", "cat": "Snacks y Galletitas", "p_ref": 2590.0,
-     "marcas": ["Lays Clásicas", "Pringles Original", "Pehuamar", "Krachitos", "Día Tubo"]},
-    {"alimento": "Snacks de Queso 95g", "cat": "Snacks y Galletitas", "p_ref": 2490.0,
-     "marcas": ["Doritos Queso", "Cheetos", "Pehuamar Quesito"]},
-    {"alimento": "Alfajor de Chocolate x unidad", "cat": "Golosinas y Chocolates", "p_ref": 1950.0,
-     "marcas": ["Havanna 70% Cacao", "Havanna Mar del Plata", "Jorgito Chocolate", "Guaymallén Triple", "Capitán del Espacio", "Milka Oreo", "Cofler Block", "Águila"]},
-    {"alimento": "Chocolate con Leche 100g", "cat": "Golosinas y Chocolates", "p_ref": 3890.0,
-     "marcas": ["Milka Legítimo", "Cofler Aireado", "Cadbury Dairy Milk", "Shot Maní", "Águila Semi Amargo"]},
-
-    # --- BEBIDAS ---
+    # --- BEBIDAS Y LIMPIEZA ---
     {"alimento": "Gaseosa Cola 1.5L", "cat": "Bebidas", "p_ref": 3190.0,
      "marcas": ["Coca-Cola Original", "Coca-Cola Sin Azúcar", "Pepsi Black", "Pepsi Clásica", "Manaos Cola"]},
-    {"alimento": "Gaseosa Lima Limón 1.5L", "cat": "Bebidas", "p_ref": 3050.0,
-     "marcas": ["Sprite Clásica", "Sprite Sin Azúcar", "7Up", "7Up Free", "Paso de los Toros Pomelo"]},
-    {"alimento": "Agua Mineral sin Gas 1.5L", "cat": "Bebidas", "p_ref": 1590.0,
-     "marcas": ["Villavicencio", "Villa del Sur", "Eco de los Andes", "Kin", "Nestlé Pureza"]},
-    {"alimento": "Agua Saborizada 1.5L", "cat": "Bebidas", "p_ref": 2090.0,
-     "marcas": ["Levité Manzana", "Levité Pomelo", "Aquarius Manzana", "Aquarius Pomelo", "Placer"]},
     {"alimento": "Cerveza Rubia Clásica 1L Retornable", "cat": "Bebidas", "p_ref": 2890.0,
-     "marcas": ["Quilmes Clásica", "Brahma Chopp", "Heineken", "Stella Artois", "Imperial Rubia", "Schneider"]},
-    {"alimento": "Cerveza Especial Lata 473ml", "cat": "Bebidas", "p_ref": 2490.0,
-     "marcas": ["Heineken", "Stella Artois", "Corona 330ml", "Patagonia Amber Lager", "Patagonia 24.7", "Imperial IPA"]},
-    {"alimento": "Vino Malbec 750ml", "cat": "Bebidas", "p_ref": 5890.0,
-     "marcas": ["Catena Zapata Álamos", "Rutini Colección", "Trapiche Alaris", "Las Moras", "San Felipe", "Cordero con Piel de Lobo", "Norton Clásico"]},
-    {"alimento": "Fernet 750ml", "cat": "Bebidas", "p_ref": 13900.0,
-     "marcas": ["Branca Clásico", "Branca Menta", "1882", "Buhero Negro"]},
-
-    # --- LIMPIEZA Y CUIDADO PERSONAL ---
+     "marcas": ["Quilmes Clásica", "Brahma Chopp", "Heineken", "Stella Artois", "Schneider"]},
     {"alimento": "Jabón Líquido Para Ropa 3L", "cat": "Limpieza", "p_ref": 10490.0,
      "marcas": ["Ala Matic", "Skip Intelligent", "Ariel Poder y Cuidado", "Drive Rosas", "Zorro", "Dia"]},
     {"alimento": "Detergente Lavavajilla 500ml", "cat": "Limpieza", "p_ref": 3490.0,
@@ -273,15 +283,7 @@ MATRIZ_GONDOLA = [
     {"alimento": "Lavandina Común 1L", "cat": "Limpieza", "p_ref": 1590.0,
      "marcas": ["Ayudín Clásica", "Querubín", "Vim Cloro Gel", "Dia", "Carrefour"]},
     {"alimento": "Rollo de Cocina Mega 3x50 paños", "cat": "Limpieza", "p_ref": 2490.0,
-     "marcas": ["Sussex Clásico", "Higienol", "Elite Ultra", "Campanita", "Dia"]},
-    {"alimento": "Papel Higiénico Doble Hoja 4x30m", "cat": "Limpieza", "p_ref": 3490.0,
-     "marcas": ["Higienol Export", "Elite Soft", "Sussex", "Felpita", "Dia"]},
-    {"alimento": "Shampoo / Acondicionador 400ml", "cat": "Perfumería", "p_ref": 4890.0,
-     "marcas": ["Sedal Ceramidas", "Pantene Pro-V", "Head & Shoulders", "Dove Reconstrucción", "Tresemmé"]},
-    {"alimento": "Crema Dental 90g", "cat": "Perfumería", "p_ref": 2990.0,
-     "marcas": ["Colgate Total 12", "Oral-B 3D White", "Sensodyne Protección Diaria", "Kolynos"]},
-    {"alimento": "Desodorante Antitranspirante Aerosol 150ml", "cat": "Perfumería", "p_ref": 3890.0,
-     "marcas": ["Rexona Odorono", "Axe Black", "Dove Original", "Nivea Dry Comfort"]}
+     "marcas": ["Sussex Clásico", "Higienol", "Elite Ultra", "Campanita", "Dia"]}
 ]
 
 def normalizar_texto(texto: str) -> str:
@@ -330,7 +332,6 @@ def generar_base_de_datos():
     df_cat = pd.DataFrame(filas_catalogo)
     df_cat["busqueda"] = (df_cat["alimento"] + " " + df_cat["marca"] + " " + df_cat["ean"]).map(normalizar_texto)
 
-    # 1. Serie Mensual Histórica alineada con el período provisto
     mensuales = []
     tienda_col_map = {
         "Coto": "p_coto",
@@ -341,7 +342,7 @@ def generar_base_de_datos():
 
     n_meses = len(MESES_SERIE)
     for idx_m, mes in enumerate(MESES_SERIE):
-        factor_inflacion = (1 + 0.021) ** (idx_m - (n_meses - 1))
+        factor_inflacion = (1 + 0.018) ** (idx_m - (n_meses - 1))
         for _, row in df_cat.iterrows():
             for tienda, col in tienda_col_map.items():
                 p_actual = row[col]
@@ -358,10 +359,9 @@ def generar_base_de_datos():
                     "precio": p_mes
                 })
 
-    # 2. Serie Diaria Intrames
     diarios = []
     for dia in range(1, 31):
-        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.021
+        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.018
         efecto_promo = 0.98 if dia % 7 in [3, 4] else 1.00
         for _, row in df_cat.iterrows():
             for tienda, col in tienda_col_map.items():
@@ -396,7 +396,6 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
     query = "+".join(normalizar_texto(f"{alimento} {marca}").split()[:3])
     res = {}
 
-    # 1. COTO DIGITAL
     p_coto_ref = float(row_dict["p_coto"])
     coto_live = False
     p_coto_final = p_coto_ref
@@ -427,7 +426,6 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
         "origen": "🟢 En Vivo (Web Coto)" if coto_live else "🟡 Relevamiento Góndola Coto"
     }
 
-    # 2. CARREFOUR (API VTEX)
     p_carr_ref = float(row_dict["p_carrefour"])
     carr_live = False
     p_carr_final = p_carr_ref
@@ -456,7 +454,6 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
         "origen": "🟢 En Vivo (API VTEX)" if carr_live else "🟡 Relevamiento Góndola Carrefour"
     }
 
-    # 3. DÍA (API VTEX)
     p_dia_ref = float(row_dict["p_dia"])
     dia_live = False
     p_dia_final = p_dia_ref
@@ -485,7 +482,6 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
         "origen": "🟢 En Vivo (API VTEX)" if dia_live else "🟡 Relevamiento Góndola Día"
     }
 
-    # 4. PEDIDOSYA MARKET BELGRANO
     p_pya_ref = float(row_dict["p_pya"])
     res["PedidosYa Market Belgrano"] = {
         "precio_regular": p_pya_ref,
@@ -514,7 +510,7 @@ if "canasta" not in st.session_state:
 canasta = st.session_state.canasta
 
 st.title("🛒 Monitor de Inflación Personal vs. Benchmarks Oficiales")
-st.caption(f"Comparación econométrica | Base activa: **{len(df_cat):,} combinaciones de alimentos y marcas** | Comercios: {', '.join(TIENDAS)}")
+st.caption(f"Medición econométrica | Base activa: **{len(df_cat):,} combinaciones de alimentos y marcas** | Comercios: {', '.join(TIENDAS)}")
 
 tab1, tab2, tab3 = st.tabs([
     "🧺 1. Armar y Editar Canasta (Alimento y Marca)",
@@ -656,7 +652,6 @@ with tab2:
     if not canasta:
         st.warning("Primero agregá productos a tu canasta en la Pestaña 1.")
     else:
-        # Selector de referencia oficial
         c_bench, c_origen = st.columns([2.5, 1.5])
         with c_bench:
             fuente_elegida = st.radio(
@@ -674,12 +669,10 @@ with tab2:
         costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
         costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
 
-        # Asignar serie oficial según selección
         if "CABA" in fuente_elegida:
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
             nombre_serie = "Oficial CABA (DGEyC)"
         else:
-            # Datos provistos por la API del INDEC (con fallback a la serie local)
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(
                 lambda m: api_indec_info["datos"].get(m, DATOS_CABA[m]["var_oficial"])
             )
@@ -704,7 +697,7 @@ with tab2:
             delta=f"{'Mayor impacto' if brecha > 0 else 'Menor impacto'} en tu canasta",
             delta_color="inverse"
         )
-        m4.metric("Último mes (Septiembre)", f"{costo_mes['var_oficial_%'].iloc[-1]:.1f}%")
+        m4.metric("Agosto (Oficial CABA)", f"{DATOS_CABA['Agosto 2026']['var_oficial']:.1f}%")
 
         st.divider()
 
