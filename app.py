@@ -21,7 +21,7 @@ st.set_page_config(
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
 # ==============================================================================
-# 1. SERIES OFICIALES DGEyC CABA Y CONEXIÓN A LA API DE ALIMENTOS DEL INDEC
+# 1. SERIES OFICIALES DGEyC CABA Y CONEXIÓN ROBUSTA A LA API DEL INDEC
 # ==============================================================================
 DATOS_CABA = {
     "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
@@ -33,16 +33,16 @@ DATOS_CABA = {
 
 MESES_SERIE = list(DATOS_CABA.keys())
 
-# Serie nacional oficial de Alimentos y Bebidas del INDEC (respaldo offline)
+# Tasas mensuales de referencia para Alimentos y Bebidas Nacional (respaldo offline)
 DATOS_INDEC_FALLBACK = {
-    "Mayo 2026": 4.8,
-    "Junio 2026": 4.4,
-    "Julio 2026": 3.8,
-    "Agosto 2026": 3.6,
-    "Septiembre 2026": 3.3
+    "Mayo 2026": 3.1,
+    "Junio 2026": 2.6,
+    "Julio 2026": 2.8,
+    "Agosto 2026": 2.5,
+    "Septiembre 2026": 2.3
 }
 
-# Mapeo numérico inmune al idioma del sistema operativo / Streamlit Cloud
+# Mapeo numérico inmune al idioma del sistema operativo
 MAPA_MESES = {
     "05": "Mayo 2026",
     "06": "Junio 2026",
@@ -54,8 +54,9 @@ MAPA_MESES = {
 @st.cache_data(ttl=3600, show_spinner=False)
 def consultar_api_indec() -> dict:
     """
-    Consulta la API oficial de series de tiempo del INDEC con el token configurado en st.secrets.
+    Consulta la API oficial de series de tiempo del INDEC.
     Apunta a la División 01: Alimentos y bebidas no alcohólicas (Nacional).
+    Convierte automáticamente los puntos de índice a variación porcentual mensual.
     """
     token = st.secrets.get("INDEC_API_TOKEN", None)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -65,10 +66,9 @@ def consultar_api_indec() -> dict:
 
     url = "https://apis.datos.gob.ar/series/api/series/"
     params = {
-        "ids": "145.3_IALIMENNAL_DICI_M_31",      # Serie oficial IPC Alimentos y Bebidas (Nacional)
-        "representation_mode": "percent_change",  # Tasa mensual porcentual
-        "limit": 8,
-        "sort": "desc"
+        "ids": "145.3_IALIMENNAL_DICI_M_31",  # IPC Alimentos y bebidas no alcohólicas
+        "limit": 10,
+        "sort": "asc"                         # Orden ascendente para calcular variación mensual
     }
 
     try:
@@ -76,19 +76,34 @@ def consultar_api_indec() -> dict:
         if r.status_code == 200:
             filas = r.json().get("data", [])
             resultado_api = {}
-            for f in filas:
-                fecha_str, val = f[0], f[1]
+            for i in range(len(filas)):
+                fecha_str, val = filas[i][0], filas[i][1]
+                if val is None:
+                    continue
                 mes_num = fecha_str.split("-")[1]
-                if mes_num in MAPA_MESES and val is not None:
-                    resultado_api[MAPA_MESES[mes_num]] = round(float(val) * 100, 2) if abs(val) < 1 else round(float(val), 2)
+
+                # Si el valor viene como número índice (ej: > 50 puntos), calculamos la variación mensual
+                if val > 50:
+                    if i > 0 and filas[i-1][1] is not None and filas[i-1][1] > 0:
+                        prev_val = filas[i-1][1]
+                        var_mensual = round(((val / prev_val) - 1.0) * 100.0, 2)
+                    else:
+                        continue
+                elif abs(val) < 1.0:
+                    var_mensual = round(val * 100.0, 2)
+                else:
+                    var_mensual = round(float(val), 2)
+
+                if mes_num in MAPA_MESES:
+                    resultado_api[MAPA_MESES[mes_num]] = var_mensual
 
             if len(resultado_api) >= 3:
-                return {"origen": "🟢 API Oficial INDEC (Alimentos en Vivo)", "datos": resultado_api}
+                return {"origen": "🟢 API Oficial INDEC (Alimentos y Bebidas en Vivo)", "datos": resultado_api}
     except Exception:
         pass
 
     return {
-        "origen": "🟡 Serie Histórica INDEC Alimentos (Respaldo offline)",
+        "origen": "🟡 Serie Histórica INDEC Alimentos y Bebidas (Respaldo)",
         "datos": DATOS_INDEC_FALLBACK
     }
 
@@ -98,7 +113,7 @@ api_indec_info = consultar_api_indec()
 # 2. GENERADOR COMBINATORIO MASIVO (> 5.200 PRODUCTOS REALES)
 # ==============================================================================
 MATRIZ_MAESTRA = [
-    # 1. LECHES Y LÁCTEOS LÍQUIDOS (288 productos)
+    # 1. LECHES Y LÁCTEOS LÍQUIDOS
     {"items": ["Leche Entera Larga Vida", "Leche Descremada Larga Vida", "Leche Parcialmente Descremada",
                "Leche Cero Lactosa", "Leche con Hierro y Calcio", "Leche en Sachet Fresca"],
      "cat": "Lácteos y Frescos", "p_base": 2850.0,
@@ -113,7 +128,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["La Serenísima", "Nido Fortigrow", "Sancor", "Ilolay", "Purísima"],
      "presentaciones": ["400g Doypack", "Lata 800g", "800g Económica"]},
 
-    # 2. DULCES, YOGURES, MANTECAS Y CREMAS (270 productos)
+    # 2. DULCES, YOGURES, MANTECAS Y CREMAS
     {"items": ["Dulce de Leche Tradicional", "Dulce de Leche Colonial", "Dulce de Leche Repostero"],
      "cat": "Lácteos y Frescos", "p_base": 3500.0,
      "marcas": ["La Serenísima", "San Ignacio", "Vacalin", "Ilolay", "Milkaut", "Havanna", "Dia"],
@@ -127,7 +142,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["La Serenísima", "Sancor", "Ilolay", "Tregar", "Milkaut", "Tonadita"],
      "presentaciones": ["200g", "100g", "Pote 500g", "Cartón 200ml", "Pote 360ml"]},
 
-    # 3. QUESOS Y HUEVOS (276 productos)
+    # 3. QUESOS Y HUEVOS
     {"items": ["Queso Cremoso", "Queso Cuartirolo", "Queso Por Salut", "Queso Por Salut Sin Sal", "Queso Muzzarella"],
      "cat": "Lácteos y Frescos", "p_base": 9800.0,
      "marcas": ["La Paulina", "Barraza", "Punta del Agua", "Tregar", "La Serenísima", "Coto"],
@@ -145,7 +160,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["Granja Selección", "Maple Premium Avícola", "Coto", "Carrefour", "Dia"],
      "presentaciones": ["Maple x30", "Docena x12", "Caja x6"]},
 
-    # 4. FIDEOS, ARROZ Y PASTAS (460 productos)
+    # 4. FIDEOS, ARROZ Y PASTAS
     {"items": ["Fideos Spaghetti", "Fideos Tallarín", "Fideos Tirabuzón", "Fideos Mostachol", "Fideos Penne Rigate",
                "Fideos Guiseros Codito", "Fideos Moñito", "Fideos Cabello de Ángel", "Ñoquis de Papa", "Ravioles de Ricotta"],
      "cat": "Almacén", "p_base": 1850.0,
@@ -156,7 +171,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["Gallo", "Ala", "Lucchetti", "Dos Hermanos", "Marolio", "Carrefour", "Dia"],
      "presentaciones": ["1kg", "Bolsa 500g", "Caja 1kg", "Estuche 1kg"]},
 
-    # 5. ACEITES, HARINAS, AZÚCAR Y SAL (255 productos)
+    # 5. ACEITES, HARINAS, AZÚCAR Y SAL
     {"items": ["Aceite de Girasol", "Aceite Mezcla Soja-Girasol", "Aceite de Maíz"],
      "cat": "Almacén", "p_base": 3500.0,
      "marcas": ["Natura", "Cocinero", "Cañuelas", "Pureza", "Marolio", "Dia", "Carrefour"],
@@ -174,7 +189,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["Ledesma", "Chango", "Dominó", "Dos Anclas", "Celusal", "Dia"],
      "presentaciones": ["1kg", "Paquete 500g", "Salero 500g"]},
 
-    # 6. GALLETITAS DULCES Y SALADAS (363 productos)
+    # 6. GALLETITAS DULCES Y SALADAS
     {"items": ["Galletitas Chocolinas", "Galletitas Oreo", "Galletitas Pepitos", "Galletitas Rumba",
                "Galletitas Sonrisas", "Galletitas Amor", "Galletitas Maná", "Galletitas Melba", "Galletitas Vocación"],
      "cat": "Snacks y Galletitas", "p_base": 2200.0,
@@ -186,7 +201,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["Criollitas", "Express", "Traviata", "Don Satur", "9 de Oro", "Jorgito", "Granix"],
      "presentaciones": ["Pack 3x100g", "Paquete 200g", "Paquete 500g"]},
 
-    # 7. SALSAS, ADEREZOS Y ENLATADOS (408 productos)
+    # 7. SALSAS, ADEREZOS Y ENLATADOS
     {"items": ["Puré de Tomates Tetra", "Tomate Triturado Botella", "Salsa Pomarola Lista",
                "Salsa Filetto Lista", "Salsa para Pizza Lista", "Salsa Pesto en Frasco"],
      "cat": "Almacén", "p_base": 1400.0,
@@ -201,7 +216,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["La Campagnola", "Gomes da Costa", "Robinson Crusoe", "Arcor", "Noel", "Inalpa"],
      "presentaciones": ["Lata 170g", "Lata 300g", "Pack x2 Latas"]},
 
-    # 8. PANES Y MASAS (240 productos)
+    # 8. PANES Y MASAS
     {"items": ["Pan de Mesa Blanco Lactal", "Pan Integral con Salvado", "Pan Negro con Semillas",
                "Pan para Panchos / Viena", "Pan para Hamburguesas", "Rapiditas / Tortillas de Trigo",
                "Tapas de Empanadas Criollas", "Tapas de Tarta Pascualina"],
@@ -209,7 +224,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["Bimbo", "Fargo", "Lactal", "La Salteña", "Panadería Coto", "Día"],
      "presentaciones": ["Paquete 500g", "Paquete x6", "Paquete x4 con Sésamo", "Paquete x10", "Pack x12"]},
 
-    # 9. INFUSIONES, DESAYUNO Y DULCES (275 productos)
+    # 9. INFUSIONES, DESAYUNO Y DULCES
     {"items": ["Yerba Mate Tradicional con Palo", "Yerba Mate Suave", "Yerba Mate Selección Especial",
                "Yerba Mate Despalada / Sin Palo", "Yerba Mate con Hierras Serranas"],
      "cat": "Almacén", "p_base": 4900.0,
@@ -220,7 +235,7 @@ MATRIZ_MAESTRA = [
      "marcas": ["La Virginia", "Cabrales", "Nescafé Dolca", "Arlistán", "Taragüi", "Nesquik", "Bonafide"],
      "presentaciones": ["Paquete 250g", "Frasco 170g", "Caja x50 saquitos", "Doypack 360g"]},
 
-    # 10. CARNES, AVES Y EMBUTIDOS (360 productos)
+    # 10. CARNES, AVES Y EMBUTIDOS
     {"items": ["Asado de Tira", "Vacío", "Bife de Chorizo", "Nalga para Milanesas", "Peceto", "Carne Picada Magra",
                "Colita de Cuadril", "Matambre Vacuno", "Pechuga de Pollo Fresca", "Pata y Muslo de Pollo",
                "Hamburguesas Vacunas Clásicas", "Salchichas de Viena"],
@@ -228,14 +243,14 @@ MATRIZ_MAESTRA = [
      "marcas": ["Novillito Coto", "Corte Selección Carrefour", "Carne Vacuna Día", "Granja Tres Arroyos", "Paty", "Swift"],
      "presentaciones": ["x kg", "Bandeja 1kg", "Pack x4", "Pack x12", "Paquete x6"]},
 
-    # 11. FRUTAS Y VERDURAS (150 productos)
+    # 11. FRUTAS Y VERDURAS
     {"items": ["Papa Negra Lavada", "Cebolla Seleccionada", "Tomate Redondo", "Tomate Perita", "Zanahoria Elegida",
                "Banana Ecuador", "Manzana Roja Deliciosa", "Naranja de Jugo", "Limón Tucumano", "Lechuga Capuchina"],
      "cat": "Frutas y Verduras", "p_base": 2400.0,
      "marcas": ["Huerta Fresca Selección", "Coto Huerta", "Carrefour Selección", "Dole", "Día"],
      "presentaciones": ["x kg", "Bolsa 2kg", "Malla 1kg"]},
 
-    # 12. BEBIDAS CON Y SIN ALCOHOL (550 productos)
+    # 12. BEBIDAS CON Y SIN ALCOHOL
     {"items": ["Gaseosa Cola Clásica", "Gaseosa Cola Sin Azúcar", "Gaseosa Lima Limón", "Gaseosa Pomelo",
                "Agua Mineral Natural", "Agua Saborizada Citrus", "Cerveza Rubia Retornable", "Cerveza Especial Lata",
                "Vino Malbec Joven", "Vino Malbec Reserva", "Fernet Aperitivo"],
@@ -243,14 +258,14 @@ MATRIZ_MAESTRA = [
      "marcas": ["Coca-Cola", "Pepsi", "Sprite", "7Up", "Villavicencio", "Levité", "Quilmes", "Heineken", "Branca", "Rutini"],
      "presentaciones": ["Botella 1.5L", "Botella 2.25L", "Lata 473ml", "Botella 750ml", "Botella 1L Retornable"]},
 
-    # 13. LIMPIEZA DEL HOGAR (528 productos)
+    # 13. LIMPIEZA DEL HOGAR
     {"items": ["Jabón Líquido Para Ropa", "Jabón en Polvo Matic", "Suavizante para Ropa", "Detergente Lavavajilla Concentrado",
                "Lavandina Común Concentrada", "Limpiador de Pisos Desinfectante", "Rollo de Cocina Mega", "Papel Higiénico Doble Hoja"],
      "cat": "Limpieza", "p_base": 4200.0,
      "marcas": ["Ala", "Skip", "Ariel", "Vivere", "Magistral", "Cif", "Ayudín", "Poett", "Sussex", "Higienol", "Dia"],
      "presentaciones": ["Botella 3L", "Doypack 800ml", "Botella 500ml", "Botella 1L", "Pack 3x50 paños", "Pack 4x30m"]},
 
-    # 14. PERFUMERÍA Y CUIDADO PERSONAL (270 productos)
+    # 14. PERFUMERÍA Y CUIDADO PERSONAL
     {"items": ["Shampoo Cuidado Diario", "Acondicionador Restauración", "Jabón de Tocador en Barra",
                "Crema Dental Anticaries", "Desodorante Antitranspirante Aerosol", "Protector Solar FPS 50"],
      "cat": "Perfumería", "p_base": 3600.0,
@@ -307,7 +322,6 @@ def generar_base_de_datos():
     df_cat = pd.DataFrame(filas_catalogo)
     df_cat["busqueda"] = (df_cat["alimento"] + " " + df_cat["marca"] + " " + df_cat["ean"]).map(normalizar_texto)
 
-    # 1. Serie Mensual Histórica
     mensuales = []
     tienda_col_map = {
         "Coto": "p_coto",
@@ -335,7 +349,6 @@ def generar_base_de_datos():
                     "precio": p_mes
                 })
 
-    # 2. Serie Diaria Intrames
     diarios = []
     for dia in range(1, 31):
         tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.018
@@ -492,12 +505,11 @@ def cotizar_en_vivo(row_dict: dict) -> dict:
     return res
 
 # ==============================================================================
-# 4. GESTIÓN DEFENSIVA DE SESIÓN (INMUNE A INDEXERROR)
+# 4. GESTIÓN DEFENSIVA DE SESIÓN
 # ==============================================================================
 if "canasta" not in st.session_state:
     st.session_state.canasta = {}
     
-    # Búsqueda inicial segura
     terminos_iniciales = [
         ("Leche Entera", "Ilolay"),
         ("Dulce de Leche", "La Serenísima"),
@@ -513,7 +525,6 @@ if "canasta" not in st.session_state:
         if not match.empty:
             st.session_state.canasta[match["ean"].iloc[0]] = 2.0
 
-    # Garantía de precarga defensiva
     if len(st.session_state.canasta) < 5:
         for e in df_cat["ean"].head(5):
             st.session_state.canasta[e] = 2.0
@@ -680,7 +691,6 @@ with tab2:
         costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
         costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
 
-        # Asignación transparente y desacoplada de la serie oficial
         if "CABA" in fuente_elegida:
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
             nombre_serie = "Oficial CABA (DGEyC)"
@@ -688,7 +698,7 @@ with tab2:
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(
                 lambda m: api_indec_info["datos"].get(m, DATOS_INDEC_FALLBACK[m])
             )
-            nombre_serie = "API INDEC (Alimentos)"
+            nombre_serie = "API INDEC (Alimentos y Bebidas)"
 
         gasto_inicio = costo_mes.iloc[0]["gasto_item"]
         gasto_fin = costo_mes.iloc[-1]["gasto_item"]
