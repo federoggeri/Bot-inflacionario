@@ -2,7 +2,7 @@
 app.py
 Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
 Catálogo masivo (>5.000 productos), benchmark oficial CABA (Agosto 1.8%) vs API INDEC Alimentos en Vivo
-sin tiempo límite de espera (timeout=None) y motor de Scraping en Vivo para el optimizador de faltantes.
+sin límite de tiempo (timeout=None) y evolución de precios diferenciada por categoría y producto.
 """
 import unicodedata
 import requests
@@ -33,7 +33,6 @@ DATOS_CABA = {
 
 MESES_SERIE = list(DATOS_CABA.keys())
 
-# Respaldo de seguridad en caso de falla crítica en los servidores de datos abiertos
 DATOS_INDEC_FALLBACK = {
     "Mayo 2026": 3.1,
     "Junio 2026": 2.6,
@@ -42,7 +41,6 @@ DATOS_INDEC_FALLBACK = {
     "Septiembre 2026": 2.3
 }
 
-# Mapeo por año y mes exactos
 MAPA_MESES = {
     "2026-05": "Mayo 2026",
     "2026-06": "Junio 2026",
@@ -51,12 +49,52 @@ MAPA_MESES = {
     "2026-09": "Septiembre 2026"
 }
 
+# Variación mensual diferenciada por categoría (rompe el sesgo del 1.8% plano)
+INFLACION_CATEGORIAS = {
+    "Junio 2026": {
+        "Lácteos y Frescos": 0.019,
+        "Almacén": 0.015,
+        "Snacks y Galletitas": 0.018,
+        "Carnicería y Granja": 0.012,
+        "Frutas y Verduras": 0.027,
+        "Bebidas": 0.014,
+        "Limpieza": 0.016,
+        "Perfumería": 0.017,
+    },
+    "Julio 2026": {
+        "Lácteos y Frescos": 0.022,
+        "Almacén": 0.017,
+        "Snacks y Galletitas": 0.021,
+        "Carnicería y Granja": 0.015,
+        "Frutas y Verduras": 0.031,
+        "Bebidas": 0.018,
+        "Limpieza": 0.020,
+        "Perfumería": 0.022,
+    },
+    "Agosto 2026": {
+        "Lácteos y Frescos": 0.017,
+        "Almacén": 0.019,
+        "Snacks y Galletitas": 0.018,
+        "Carnicería y Granja": 0.023,
+        "Frutas y Verduras": 0.010,
+        "Bebidas": 0.016,
+        "Limpieza": 0.015,
+        "Perfumería": 0.018,
+    },
+    "Septiembre 2026": {
+        "Lácteos y Frescos": 0.024,
+        "Almacén": 0.020,
+        "Snacks y Galletitas": 0.022,
+        "Carnicería y Granja": 0.025,
+        "Frutas y Verduras": 0.019,
+        "Bebidas": 0.021,
+        "Limpieza": 0.023,
+        "Perfumería": 0.024,
+    },
+}
+
 @st.cache_data(ttl=3600, show_spinner="⏳ Esperando respuesta completa de la API oficial del INDEC...")
 def consultar_api_indec() -> dict:
-    """
-    Consulta la API oficial del INDEC sin tiempo máximo de espera (timeout=None).
-    Espera la respuesta del servidor el tiempo necesario para obtener los datos oficiales.
-    """
     token = st.secrets.get("INDEC_API_TOKEN", None)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     if token:
@@ -65,7 +103,7 @@ def consultar_api_indec() -> dict:
 
     url = "https://apis.datos.gob.ar/series/api/series/"
     params = {
-        "ids": "145.3_IALIMENNAL_DICI_M_31",      # IPC Alimentos y bebidas (Nacional)
+        "ids": "145.3_IALIMENNAL_DICI_M_31",
         "start_date": "2026-01-01",
         "representation_mode": "percent_change",
         "limit": 12,
@@ -73,7 +111,6 @@ def consultar_api_indec() -> dict:
     }
 
     try:
-        # timeout=None elimina cualquier corte por límite de tiempo de espera
         r = requests.get(url, params=params, headers=headers, timeout=None)
         if r.status_code == 200:
             filas = r.json().get("data", [])
@@ -289,7 +326,6 @@ def generar_base_de_datos():
                     c += 1
 
                     alimento_completo = f"{it} {pres}"
-                    # Verificación de mercado: Leche Ilolay en Coto = $2.799
                     if "Leche" in it and m == "Ilolay" and "1L" in pres:
                         p_coto = 2799.0
                         p_carr = 2850.0
@@ -318,7 +354,7 @@ def generar_base_de_datos():
     df_cat = pd.DataFrame(filas_catalogo)
     df_cat["busqueda"] = (df_cat["alimento"] + " " + df_cat["marca"] + " " + df_cat["ean"]).map(normalizar_texto)
 
-    # Serie Mensual Histórica
+    # 1. Serie Mensual Histórica con tasas dinámicas por categoría y producto
     mensuales = []
     tienda_col_map = {
         "Coto": "p_coto",
@@ -327,34 +363,59 @@ def generar_base_de_datos():
         "PedidosYa Market Belgrano": "p_pya"
     }
 
-    n_meses = len(MESES_SERIE)
-    for idx_m, mes in enumerate(MESES_SERIE):
-        factor_inflacion = (1 + 0.018) ** (idx_m - (n_meses - 1))
-        for _, row in df_cat.iterrows():
-            for tienda, col in tienda_col_map.items():
-                p_actual = row[col]
-                p_mes = round(p_actual * factor_inflacion, 2)
+    for _, row in df_cat.iterrows():
+        cat = row["cat"]
+        ean = row["ean"]
+
+        # Variaciones dinámicas mensuales particulares por producto
+        d_sep = ((hash(f"{ean}_sep") % 13) - 6) * 0.0007
+        d_ago = ((hash(f"{ean}_ago") % 13) - 6) * 0.0007
+        d_jul = ((hash(f"{ean}_jul") % 13) - 6) * 0.0007
+        d_jun = ((hash(f"{ean}_jun") % 13) - 6) * 0.0007
+
+        g_sep = INFLACION_CATEGORIAS["Septiembre 2026"].get(cat, 0.021) + d_sep
+        g_ago = INFLACION_CATEGORIAS["Agosto 2026"].get(cat, 0.018) + d_ago
+        g_jul = INFLACION_CATEGORIAS["Julio 2026"].get(cat, 0.019) + d_jul
+        g_jun = INFLACION_CATEGORIAS["Junio 2026"].get(cat, 0.016) + d_jun
+
+        for tienda, col in tienda_col_map.items():
+            p_4 = row[col]                                    # Septiembre 2026
+            p_3 = round(p_4 / (1.0 + g_sep), 2)               # Agosto 2026
+            p_2 = round(p_3 / (1.0 + g_ago), 2)               # Julio 2026
+            p_1 = round(p_2 / (1.0 + g_jul), 2)               # Junio 2026
+            p_0 = round(p_1 / (1.0 + g_jun), 2)               # Mayo 2026
+
+            precios_periodos = [p_0, p_1, p_2, p_3, p_4]
+
+            for idx_m, mes in enumerate(MESES_SERIE):
                 mensuales.append({
                     "mes_idx": idx_m,
                     "mes": mes,
-                    "ean": row["ean"],
+                    "ean": ean,
                     "producto": row["producto_completo"],
                     "alimento": row["alimento"],
                     "marca": row["marca"],
-                    "categoria": row["cat"],
+                    "categoria": cat,
                     "supermercado": tienda,
-                    "precio": p_mes
+                    "precio": precios_periodos[idx_m]
                 })
 
-    # Serie Diaria Intrames
+    # 2. Serie Diaria Intrames con promociones y estacionalidad
     diarios = []
     for dia in range(1, 31):
-        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.018
-        efecto_promo = 0.98 if dia % 7 in [3, 4] else 1.00
+        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.021
         for _, row in df_cat.iterrows():
             for tienda, col in tienda_col_map.items():
+                promo_tienda = 1.0
+                if tienda == "Coto" and dia % 7 in [2, 3]:       # Miércoles/Jueves Comunidad Coto
+                    promo_tienda = 0.85
+                elif tienda == "Dia" and dia % 7 in [1, 5]:      # Martes/Sábado Club Día
+                    promo_tienda = 0.90
+                elif tienda == "Carrefour" and dia % 7 in [4, 5]: # Viernes/Sábado Mi Carrefour
+                    promo_tienda = 0.92
+
                 p_actual = row[col]
-                p_dia = round(p_actual * tasa_dia * efecto_promo, 2)
+                p_dia = round(p_actual * tasa_dia * promo_tienda, 2)
                 diarios.append({
                     "dia_num": dia,
                     "dia": f"Día {dia:02d}",
@@ -615,8 +676,15 @@ with tab1:
             if st.button("Crear y Sumar"):
                 if nom_custom.strip():
                     ean_custom = f"77999{abs(hash(nom_custom + mar_custom)) % 100000000:08d}"
+                    if "custom_items_dict" not in st.session_state:
+                        st.session_state.custom_items_dict = {}
+                    st.session_state.custom_items_dict[ean_custom] = {
+                        "alimento": nom_custom.strip(),
+                        "marca": mar_custom.strip() if mar_custom.strip() else "Genérica",
+                        "p_ref": pr_custom
+                    }
                     canasta[ean_custom] = 2.0
-                    st.success(f"¡'{nom_custom} ({mar_custom})' creado y sumado a tu canasta!")
+                    st.success(f"¡'{nom_custom}' creado y sumado a tu canasta!")
                     st.rerun()
 
     st.divider()
@@ -638,6 +706,18 @@ with tab1:
                     "Cantidad Mensual (q₀)": q,
                     "Subtotal Coto ($)": f"${(row['p_coto'] * q):,.2f}"
                 })
+            elif "custom_items_dict" in st.session_state and e in st.session_state.custom_items_dict:
+                row_c = st.session_state.custom_items_dict[e]
+                tabla_canasta.append({
+                    "Categoría": "Personalizado",
+                    "Alimento": row_c["alimento"],
+                    "Marca": row_c["marca"],
+                    "Precio Coto ($)": f"${row_c['p_ref']:,.2f}",
+                    "Precio Carrefour ($)": f"${row_c['p_ref']:,.2f}",
+                    "Precio Día ($)": f"${row_c['p_ref']:,.2f}",
+                    "Cantidad Mensual (q₀)": q,
+                    "Subtotal Coto ($)": f"${(row_c['p_ref'] * q):,.2f}"
+                })
         st.dataframe(pd.DataFrame(tabla_canasta), hide_index=True, use_container_width=True)
 
         col_del, col_btn_del, col_vaciar = st.columns([3, 1, 1])
@@ -645,6 +725,10 @@ with tab1:
             nombres_en_canasta = {
                 e: f"{info_df.loc[e, 'alimento']} — {info_df.loc[e, 'marca']}" for e in canasta if e in info_df.index
             }
+            if "custom_items_dict" in st.session_state:
+                for e_c, data_c in st.session_state.custom_items_dict.items():
+                    nombres_en_canasta[e_c] = f"{data_c['alimento']} — {data_c['marca']}"
+
             ean_borrar = st.selectbox(
                 "Seleccionar ítem para eliminar:", list(canasta.keys()),
                 format_func=lambda e: nombres_en_canasta.get(e, e)
@@ -695,10 +779,41 @@ with tab2:
         sub_m["q0"] = sub_m["ean"].map(canasta)
         sub_m["gasto_item"] = sub_m["precio"] * sub_m["q0"]
 
+        # Soporte para ítems agregados manualmente
+        faltantes_ean = [e for e in canasta.keys() if e not in df_mensual["ean"].values]
+        if faltantes_ean and "custom_items_dict" in st.session_state:
+            filas_custom_m = []
+            for e_f in faltantes_ean:
+                info_c = st.session_state.custom_items_dict.get(e_f, {})
+                p_c = info_c.get("p_ref", 2500.0)
+                nom_c = info_c.get("alimento", "Personalizado")
+                mar_c = info_c.get("marca", "Genérica")
+                q_c = canasta[e_f]
+                factores_c = [0.925, 0.942, 0.961, 0.979, 1.0]
+                for idx_m, mes in enumerate(MESES_SERIE):
+                    for t in TIENDAS:
+                        pr_calc = round(p_c * factores_c[idx_m], 2)
+                        filas_custom_m.append({
+                            "mes_idx": idx_m,
+                            "mes": mes,
+                            "ean": e_f,
+                            "producto": f"{nom_c} — {mar_c}",
+                            "alimento": nom_c,
+                            "marca": mar_c,
+                            "categoria": "Personalizado",
+                            "supermercado": t,
+                            "precio": pr_calc,
+                            "q0": q_c,
+                            "gasto_item": pr_calc * q_c
+                        })
+            if filas_custom_m:
+                sub_m = pd.concat([sub_m, pd.DataFrame(filas_custom_m)], ignore_index=True)
+
+        # Calculamos el costo mensual de la canasta promedio de mercado
         costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
+        costo_mes["gasto_item"] = costo_mes["gasto_item"] / len(TIENDAS)
         costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
 
-        # Asignación transparente de la serie
         if "CABA" in fuente_elegida:
             costo_mes["var_oficial_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
             nombre_serie = "Oficial CABA (DGEyC)"
@@ -727,7 +842,7 @@ with tab2:
             delta=f"{'Mayor impacto' if brecha > 0 else 'Menor impacto'} en tu canasta",
             delta_color="inverse"
         )
-        m4.metric("Agosto Oficial", f"{costo_mes[costo_mes['mes'] == 'Agosto 2026']['var_oficial_%'].iloc[0]:.1f}%")
+        m4.metric("Último mes oficial (Sep)", f"{costo_mes['var_oficial_%'].iloc[-1]:.1f}%")
 
         st.divider()
 
@@ -807,11 +922,20 @@ with tab3:
     info_df = df_cat.set_index("ean")
     opciones_falt = list(canasta.keys()) if canasta else df_cat["ean"].head(10).tolist()
 
+    format_dict = {}
+    for e in opciones_falt:
+        if e in info_df.index:
+            format_dict[e] = f"{info_df.loc[e, 'alimento']} — {info_df.loc[e, 'marca']}"
+        elif "custom_items_dict" in st.session_state and e in st.session_state.custom_items_dict:
+            format_dict[e] = f"{st.session_state.custom_items_dict[e]['alimento']} — {st.session_state.custom_items_dict[e]['marca']}"
+        else:
+            format_dict[e] = str(e)
+
     seleccion = st.multiselect(
         "Alimentos a cotizar:",
         options=opciones_falt,
         default=opciones_falt[:3] if len(opciones_falt) >= 3 else opciones_falt,
-        format_func=lambda e: f"{info_df.loc[e, 'alimento']} — {info_df.loc[e, 'marca']}" if e in info_df.index else e
+        format_func=lambda e: format_dict.get(e, str(e))
     )
 
     if seleccion:
@@ -823,6 +947,17 @@ with tab3:
             for ean_sel in seleccion:
                 if ean_sel in info_df.index:
                     row_datos = info_df.loc[ean_sel].to_dict()
+                elif "custom_items_dict" in st.session_state and ean_sel in st.session_state.custom_items_dict:
+                    item_c = st.session_state.custom_items_dict[ean_sel]
+                    p_c = item_c["p_ref"]
+                    row_datos = {
+                        "alimento": item_c["alimento"],
+                        "marca": item_c["marca"],
+                        "p_coto": round(p_c * 0.988, 2),
+                        "p_carrefour": round(p_c * 1.0, 2),
+                        "p_dia": round(p_c * 0.955, 2),
+                        "p_pya": round(p_c * 1.155, 2),
+                    }
                 else:
                     row_datos = {
                         "alimento": "Alimento Personalizado",
@@ -869,6 +1004,9 @@ with tab3:
             if ean_sel in info_df.index:
                 nom_a = info_df.loc[ean_sel, "alimento"]
                 nom_m = info_df.loc[ean_sel, "marca"]
+            elif "custom_items_dict" in st.session_state and ean_sel in st.session_state.custom_items_dict:
+                nom_a = st.session_state.custom_items_dict[ean_sel]["alimento"]
+                nom_m = st.session_state.custom_items_dict[ean_sel]["marca"]
             else:
                 nom_a = "Alimento Personalizado"
                 nom_m = "Especial"
