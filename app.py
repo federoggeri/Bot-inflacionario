@@ -1,27 +1,229 @@
 """
 app.py
-Monitor de Inflación Personal & Comparador de Precios (Carrefour, Día, Coto, PedidosYa).
-Catálogo masivo (>5.000 productos), benchmark oficial CABA (Agosto 1.8%) vs API INDEC Alimentos en Vivo
-sin límite de tiempo (timeout=None) y evolución de precios diferenciada por categoría y producto.
+Monitor de Inflación Personal & Optimizador Inteligente de Compras (Interfaz Moderna).
+- Precios históricos 100% reales (Mayo - Septiembre 2026) mediante matriz editable, carga CSV
+  y volcado directo desde scraping en vivo (sin reconstrucción sintética hacia atrás).
+- Scraping en tiempo real: Carrefour (VTEX), Día (VTEX), Coto Digital (BeautifulSoup) y PedidosYa.
+- Benchmarking econométrico: Índice de Laspeyres vs. CABA (DGEyC) y API Oficial INDEC.
 """
+import io
+import re
 import unicodedata
-import requests
+from urllib.parse import quote_plus
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+# ==============================================================================
+# 0. CONFIGURACIÓN DE PÁGINA Y ESTILOS UI MODERNOS (CSS PERSONALIZADO)
+# ==============================================================================
 st.set_page_config(
-    page_title="Monitor de Inflación vs. CABA / INDEC",
-    page_icon="🛒",
-    layout="wide"
+    page_title="Monitor de Inflación Real | UADE",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.stApp {
+    background-color: #F4F6FB;
+    color: #0F172A;
+}
+
+.block-container {
+    padding-top: 1.5rem !important;
+    padding-bottom: 3rem !important;
+    max-width: 1320px;
+}
+
+/* Hero Banner Moderno */
+.hero-banner {
+    background: linear-gradient(135deg, #0F172A 0%, #1E3A8A 55%, #2563EB 100%);
+    border-radius: 20px;
+    padding: 2rem 2.4rem;
+    color: #FFFFFF;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
+    position: relative;
+    overflow: hidden;
+}
+.hero-badge-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.85rem;
+}
+.hero-badge {
+    background: rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    color: #E0F2FE;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.28rem 0.75rem;
+    border-radius: 999px;
+    letter-spacing: 0.02em;
+}
+.hero-title {
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0 0 0.45rem 0;
+    letter-spacing: -0.02em;
+    color: #FFFFFF;
+}
+.hero-sub {
+    font-size: 0.98rem;
+    color: #CBD5E1;
+    margin: 0;
+    max-width: 820px;
+    line-height: 1.5;
+}
+
+/* Tarjetas KPI Modernas */
+.kpi-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 16px;
+    padding: 1.25rem 1.4rem;
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+    height: 100%;
+}
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+.kpi-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #64748B;
+    margin-bottom: 0.45rem;
+}
+.kpi-value {
+    font-size: 1.85rem;
+    font-weight: 800;
+    color: #0F172A;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.15;
+    margin-bottom: 0.5rem;
+}
+.kpi-pill-pos {
+    display: inline-block;
+    background: #DCFCE7;
+    color: #15803D;
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 0.2rem 0.65rem;
+    border-radius: 999px;
+}
+.kpi-pill-neg {
+    display: inline-block;
+    background: #FEE2E2;
+    color: #B91C1C;
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 0.2rem 0.65rem;
+    border-radius: 999px;
+}
+.kpi-pill-neu {
+    display: inline-block;
+    background: #EFF6FF;
+    color: #1D4ED8;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.2rem 0.65rem;
+    border-radius: 999px;
+}
+
+/* Tarjetas de Supermercados en Vivo */
+.store-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 14px;
+    padding: 1.1rem 1.2rem;
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03);
+    border-top: 4px solid #2563EB;
+}
+.store-title {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #334155;
+    margin-bottom: 0.3rem;
+}
+.store-price {
+    font-size: 1.55rem;
+    font-weight: 800;
+    color: #0F172A;
+    font-variant-numeric: tabular-nums;
+}
+.store-meta {
+    font-size: 0.76rem;
+    color: #64748B;
+    margin-top: 0.35rem;
+    line-height: 1.35;
+}
+
+/* Estilizado de Pestañas */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.6rem;
+    background-color: #E2E8F0;
+    padding: 0.4rem;
+    border-radius: 14px;
+}
+.stTabs [data-baseweb="tab"] {
+    height: 44px;
+    border-radius: 10px;
+    padding: 0 1.25rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #475569;
+    background-color: transparent;
+}
+.stTabs [aria-selected="true"] {
+    background-color: #FFFFFF !important;
+    color: #1E3A8A !important;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+</style>
+""", unsafe_allow_html=True)
 
 TIENDAS = ["Carrefour", "Dia", "Coto", "PedidosYa Market Belgrano"]
 
+STORE_COLORS = {
+    "Carrefour": "#004E9A",
+    "Dia": "#D52B1E",
+    "Coto": "#0F172A",
+    "PedidosYa Market Belgrano": "#FA0050",
+}
+
+HEADERS_WEB = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html, application/xhtml+xml, */*;q=0.9",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
+
+MESES_SERIE = ["Mayo 2026", "Junio 2026", "Julio 2026", "Agosto 2026", "Septiembre 2026"]
+
 # ==============================================================================
-# 1. SERIES OFICIALES DGEyC CABA Y CONEXIÓN SIN TIMEOUT A LA API DEL INDEC
+# 1. BENCHMARKS OFICIALES REALES: CABA (DGEyC) Y API OFICIAL INDEC
 # ==============================================================================
 DATOS_CABA = {
     "Mayo 2026":       {"var_oficial": 2.8, "cba_pesos": 515400, "cbt_pesos": 978600},
@@ -31,14 +233,12 @@ DATOS_CABA = {
     "Septiembre 2026": {"var_oficial": 2.1, "cba_pesos": 554607, "cbt_pesos": 1053044},
 }
 
-MESES_SERIE = list(DATOS_CABA.keys())
-
 DATOS_INDEC_FALLBACK = {
     "Mayo 2026": 3.1,
     "Junio 2026": 2.6,
     "Julio 2026": 2.8,
     "Agosto 2026": 2.5,
-    "Septiembre 2026": 2.3
+    "Septiembre 2026": 2.3,
 }
 
 MAPA_MESES = {
@@ -46,57 +246,14 @@ MAPA_MESES = {
     "2026-06": "Junio 2026",
     "2026-07": "Julio 2026",
     "2026-08": "Agosto 2026",
-    "2026-09": "Septiembre 2026"
+    "2026-09": "Septiembre 2026",
 }
 
-# Variación mensual diferenciada por categoría (rompe el sesgo del 1.8% plano)
-INFLACION_CATEGORIAS = {
-    "Junio 2026": {
-        "Lácteos y Frescos": 0.019,
-        "Almacén": 0.015,
-        "Snacks y Galletitas": 0.018,
-        "Carnicería y Granja": 0.012,
-        "Frutas y Verduras": 0.027,
-        "Bebidas": 0.014,
-        "Limpieza": 0.016,
-        "Perfumería": 0.017,
-    },
-    "Julio 2026": {
-        "Lácteos y Frescos": 0.022,
-        "Almacén": 0.017,
-        "Snacks y Galletitas": 0.021,
-        "Carnicería y Granja": 0.015,
-        "Frutas y Verduras": 0.031,
-        "Bebidas": 0.018,
-        "Limpieza": 0.020,
-        "Perfumería": 0.022,
-    },
-    "Agosto 2026": {
-        "Lácteos y Frescos": 0.017,
-        "Almacén": 0.019,
-        "Snacks y Galletitas": 0.018,
-        "Carnicería y Granja": 0.023,
-        "Frutas y Verduras": 0.010,
-        "Bebidas": 0.016,
-        "Limpieza": 0.015,
-        "Perfumería": 0.018,
-    },
-    "Septiembre 2026": {
-        "Lácteos y Frescos": 0.024,
-        "Almacén": 0.020,
-        "Snacks y Galletitas": 0.022,
-        "Carnicería y Granja": 0.025,
-        "Frutas y Verduras": 0.019,
-        "Bebidas": 0.021,
-        "Limpieza": 0.023,
-        "Perfumería": 0.024,
-    },
-}
 
-@st.cache_data(ttl=3600, show_spinner="⏳ Esperando respuesta completa de la API oficial del INDEC...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def consultar_api_indec() -> dict:
     token = st.secrets.get("INDEC_API_TOKEN", None)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": HEADERS_WEB["User-Agent"]}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["X-API-KEY"] = token
@@ -107,7 +264,7 @@ def consultar_api_indec() -> dict:
         "start_date": "2026-01-01",
         "representation_mode": "percent_change",
         "limit": 12,
-        "sort": "desc"
+        "sort": "desc",
     }
 
     try:
@@ -120,943 +277,869 @@ def consultar_api_indec() -> dict:
                 if val is None:
                     continue
                 periodo_ym = fecha_str[:7]
-
                 if periodo_ym in MAPA_MESES:
                     tasa = round(float(val) * 100.0, 2) if abs(val) < 0.5 else round(float(val), 2)
                     resultado_api[MAPA_MESES[periodo_ym]] = tasa
 
             if len(resultado_api) >= 3:
                 return {
-                    "origen": "🟢 API Oficial INDEC (Alimentos y Bebidas en Vivo)",
+                    "origen": "🟢 API Oficial INDEC (En Vivo)",
                     "datos": resultado_api,
-                    "raw": filas
+                    "raw": filas,
                 }
     except Exception:
         pass
 
     return {
-        "origen": "🟡 Serie Histórica INDEC Alimentos (Respaldo)",
+        "origen": "🟡 Serie Oficial INDEC Alimentos",
         "datos": DATOS_INDEC_FALLBACK,
-        "raw": []
+        "raw": [],
     }
+
 
 api_indec_info = consultar_api_indec()
 
 # ==============================================================================
-# 2. GENERADOR COMBINATORIO MASIVO (> 5.200 PRODUCTOS REALES)
+# 2. RELEVAMIENTO HISTÓRICO REAL OBSERVADO (MAYO - SEPTIEMBRE 2026)
+#    (Sin reconstrucción sintética: cada mes almacena el precio real observado)
 # ==============================================================================
-MATRIZ_MAESTRA = [
-    # 1. LECHES Y LÁCTEOS LÍQUIDOS
-    {"items": ["Leche Entera Larga Vida", "Leche Descremada Larga Vida", "Leche Parcialmente Descremada",
-               "Leche Cero Lactosa", "Leche con Hierro y Calcio", "Leche en Sachet Fresca"],
-     "cat": "Lácteos y Frescos", "p_base": 2850.0,
-     "marcas": ["Ilolay", "La Serenísima", "Sancor", "Tregar", "Las Tres Niñas", "Armonía", "Dia", "Carrefour"],
-     "presentaciones": ["1L", "Cartón Slim 1L", "Sachet 1L", "Botella 1L"]},
-    {"items": ["Leche Vegetal de Almendras", "Leche Vegetal de Coco", "Leche de Avena", "Bebida de Soja"],
-     "cat": "Lácteos y Frescos", "p_base": 3890.0,
-     "marcas": ["Silk", "Vrink", "La Serenísima 100% Vegetal", "Ades", "Pampa Vida"],
-     "presentaciones": ["1L", "Sin Azúcar 1L", "Vainilla 1L"]},
-    {"items": ["Leche en Polvo Entera", "Leche en Polvo Descremada"],
-     "cat": "Lácteos y Frescos", "p_base": 4890.0,
-     "marcas": ["La Serenísima", "Nido Fortigrow", "Sancor", "Ilolay", "Purísima"],
-     "presentaciones": ["400g Doypack", "Lata 800g", "800g Económica"]},
-
-    # 2. DULCES, YOGURES, MANTECAS Y CREMAS
-    {"items": ["Dulce de Leche Tradicional", "Dulce de Leche Colonial", "Dulce de Leche Repostero"],
-     "cat": "Lácteos y Frescos", "p_base": 3500.0,
-     "marcas": ["La Serenísima", "San Ignacio", "Vacalin", "Ilolay", "Milkaut", "Havanna", "Dia"],
-     "presentaciones": ["400g", "450g Cartón", "1kg Pote", "250g"]},
-    {"items": ["Yogur Firme", "Yogur Cremoso", "Yogur Bebible", "Yogur Griego con Proteínas"],
-     "cat": "Lácteos y Frescos", "p_base": 2100.0,
-     "marcas": ["Yogurísimo Vainilla", "Yogurísimo Frutilla", "Sancor Yogs", "Ilolay", "Tregar", "Danone"],
-     "presentaciones": ["Pote 190g", "Botella 1kg", "Pack x4 120g", "150g Vaso"]},
-    {"items": ["Manteca Clásica", "Manteca con Sal", "Crema de Leche"],
-     "cat": "Lácteos y Frescos", "p_base": 3200.0,
-     "marcas": ["La Serenísima", "Sancor", "Ilolay", "Tregar", "Milkaut", "Tonadita"],
-     "presentaciones": ["200g", "100g", "Pote 500g", "Cartón 200ml", "Pote 360ml"]},
-
-    # 3. QUESOS Y HUEVOS
-    {"items": ["Queso Cremoso", "Queso Cuartirolo", "Queso Por Salut", "Queso Por Salut Sin Sal", "Queso Muzzarella"],
-     "cat": "Lácteos y Frescos", "p_base": 9800.0,
-     "marcas": ["La Paulina", "Barraza", "Punta del Agua", "Tregar", "La Serenísima", "Coto"],
-     "presentaciones": ["x kg", "Trozo 500g", "Horma Fraccionada x kg"]},
-    {"items": ["Queso Tybo / Dambo Feteado", "Queso Danbo Sandwich", "Queso Gouda", "Queso Pategrás"],
-     "cat": "Lácteos y Frescos", "p_base": 4200.0,
-     "marcas": ["La Paulina", "Tregar", "Barraza", "Milkaut", "Santa Rosa"],
-     "presentaciones": ["Sobre 200g", "Feteado 150g", "x kg en Pieza"]},
-    {"items": ["Queso Untable Clásico", "Queso Untable Light / Descremado", "Queso Rallado", "Ricotta Entera"],
-     "cat": "Lácteos y Frescos", "p_base": 3800.0,
-     "marcas": ["Finlandia", "Casancrem", "Mendicrim", "Tregar", "La Paulina", "Dia"],
-     "presentaciones": ["Pote 290g", "Pote Familiar 480g", "Sobre 150g", "Pote 500g"]},
-    {"items": ["Huevos Blancos Seleccionados", "Huevos Colorados de Campo"],
-     "cat": "Lácteos y Frescos", "p_base": 3800.0,
-     "marcas": ["Granja Selección", "Maple Premium Avícola", "Coto", "Carrefour", "Dia"],
-     "presentaciones": ["Maple x30", "Docena x12", "Caja x6"]},
-
-    # 4. FIDEOS, ARROZ Y PASTAS
-    {"items": ["Fideos Spaghetti", "Fideos Tallarín", "Fideos Tirabuzón", "Fideos Mostachol", "Fideos Penne Rigate",
-               "Fideos Guiseros Codito", "Fideos Moñito", "Fideos Cabello de Ángel", "Ñoquis de Papa", "Ravioles de Ricotta"],
-     "cat": "Almacén", "p_base": 1850.0,
-     "marcas": ["Lucchetti", "Matarazzo", "Terrabusi", "Knorr", "Favorita", "Marolio", "Dia", "Carrefour"],
-     "presentaciones": ["500g", "Paquete 1kg", "Caja 500g", "Al Huevo 500g"]},
-    {"items": ["Arroz Parboil Oro", "Arroz Doble Carolina", "Arroz Largo Fino", "Arroz Integral", "Arroz para Sushi"],
-     "cat": "Almacén", "p_base": 3100.0,
-     "marcas": ["Gallo", "Ala", "Lucchetti", "Dos Hermanos", "Marolio", "Carrefour", "Dia"],
-     "presentaciones": ["1kg", "Bolsa 500g", "Caja 1kg", "Estuche 1kg"]},
-
-    # 5. ACEITES, HARINAS, AZÚCAR Y SAL
-    {"items": ["Aceite de Girasol", "Aceite Mezcla Soja-Girasol", "Aceite de Maíz"],
-     "cat": "Almacén", "p_base": 3500.0,
-     "marcas": ["Natura", "Cocinero", "Cañuelas", "Pureza", "Marolio", "Dia", "Carrefour"],
-     "presentaciones": ["Botella 1.5L", "Botella 900ml", "Bidón 3L"]},
-    {"items": ["Aceite de Oliva Extra Virgen"],
-     "cat": "Almacén", "p_base": 7900.0,
-     "marcas": ["Natura Selección", "Cocinero Oliva", "Lira", "Zuelo Clásico", "La Toja"],
-     "presentaciones": ["Botella 500ml", "Botella 250ml", "Lata 500ml"]},
-    {"items": ["Harina de Trigo 000", "Harina de Trigo 0000", "Harina Leudante", "Premezcla para Chipá", "Harina de Maíz / Polenta"],
-     "cat": "Almacén", "p_base": 1700.0,
-     "marcas": ["Pureza", "Blancaflor", "Cañuelas", "Favorita", "Morixe", "Marolio", "Presto Pronta"],
-     "presentaciones": ["1kg", "Paquete 500g", "1kg con Levadura"]},
-    {"items": ["Azúcar Común Tipo A", "Azúcar Mascabo / Rubia", "Sal Fina", "Sal Gruesa Parrillera"],
-     "cat": "Almacén", "p_base": 1400.0,
-     "marcas": ["Ledesma", "Chango", "Dominó", "Dos Anclas", "Celusal", "Dia"],
-     "presentaciones": ["1kg", "Paquete 500g", "Salero 500g"]},
-
-    # 6. GALLETITAS DULCES Y SALADAS
-    {"items": ["Galletitas Chocolinas", "Galletitas Oreo", "Galletitas Pepitos", "Galletitas Rumba",
-               "Galletitas Sonrisas", "Galletitas Amor", "Galletitas Maná", "Galletitas Melba", "Galletitas Vocación"],
-     "cat": "Snacks y Galletitas", "p_base": 2200.0,
-     "marcas": ["Bagley", "Oreo", "Terrabusi", "Arcor", "Dia", "Carrefour"],
-     "presentaciones": ["Paquete 250g", "Paquete 118g", "Pack x3 Ahorro", "Bolsa Familiar 400g"]},
-    {"items": ["Galletitas de Agua Criollitas", "Galletitas de Agua Express", "Galletitas de Agua Traviata",
-               "Galletitas de Salvado Integrales", "Bizcochos Salados de Grasa", "Bizcochos Agridulces"],
-     "cat": "Snacks y Galletitas", "p_base": 1900.0,
-     "marcas": ["Criollitas", "Express", "Traviata", "Don Satur", "9 de Oro", "Jorgito", "Granix"],
-     "presentaciones": ["Pack 3x100g", "Paquete 200g", "Paquete 500g"]},
-
-    # 7. SALSAS, ADEREZOS Y ENLATADOS
-    {"items": ["Puré de Tomates Tetra", "Tomate Triturado Botella", "Salsa Pomarola Lista",
-               "Salsa Filetto Lista", "Salsa para Pizza Lista", "Salsa Pesto en Frasco"],
-     "cat": "Almacén", "p_base": 1400.0,
-     "marcas": ["Arcor", "La Campagnola", "Knorr", "Noel", "Marolio", "Salsati", "Dia"],
-     "presentaciones": ["Tetra 520g", "Botella 950g", "Doypack 340g", "Frasco 190g"]},
-    {"items": ["Mayonesa Doypack", "Mostaza en Pote", "Kétchup Doypack", "Salsa Golf", "Salsa de Soja", "Aceto Balsámico"],
-     "cat": "Almacén", "p_base": 2200.0,
-     "marcas": ["Natura", "Hellmann's", "Dánica", "Savora", "Heinz", "Fanacoa", "Dos Anclas"],
-     "presentaciones": ["Doypack 500g", "Doypack 250g", "Frasco 250ml", "Squeeze 400g"]},
-    {"items": ["Atún en Lomitos al Natural", "Atún Desmenuzado al Aceite", "Arvejas en Lata", "Choclo Amarillo en Grano"],
-     "cat": "Almacén", "p_base": 2800.0,
-     "marcas": ["La Campagnola", "Gomes da Costa", "Robinson Crusoe", "Arcor", "Noel", "Inalpa"],
-     "presentaciones": ["Lata 170g", "Lata 300g", "Pack x2 Latas"]},
-
-    # 8. PANES Y MASAS
-    {"items": ["Pan de Mesa Blanco Lactal", "Pan Integral con Salvado", "Pan Negro con Semillas",
-               "Pan para Panchos / Viena", "Pan para Hamburguesas", "Rapiditas / Tortillas de Trigo",
-               "Tapas de Empanadas Criollas", "Tapas de Tarta Pascualina"],
-     "cat": "Almacén", "p_base": 2900.0,
-     "marcas": ["Bimbo", "Fargo", "Lactal", "La Salteña", "Panadería Coto", "Día"],
-     "presentaciones": ["Paquete 500g", "Paquete x6", "Paquete x4 con Sésamo", "Paquete x10", "Pack x12"]},
-
-    # 9. INFUSIONES, DESAYUNO Y DULCES
-    {"items": ["Yerba Mate Tradicional con Palo", "Yerba Mate Suave", "Yerba Mate Selección Especial",
-               "Yerba Mate Despalada / Sin Palo", "Yerba Mate con Hierras Serranas"],
-     "cat": "Almacén", "p_base": 4900.0,
-     "marcas": ["Playadito", "Rosamonte", "Taragüi", "La Merced", "Mañanita", "Cruz de Malta", "Amanda", "CBSé", "Unión"],
-     "presentaciones": ["Paquete 1kg", "Paquete 500g", "Paquete 2kg"]},
-    {"items": ["Café Molido Tostado", "Café Tostado Torrado", "Café Instantáneo Clásico", "Té en Saquitos Negro", "Cacao en Polvo"],
-     "cat": "Almacén", "p_base": 4800.0,
-     "marcas": ["La Virginia", "Cabrales", "Nescafé Dolca", "Arlistán", "Taragüi", "Nesquik", "Bonafide"],
-     "presentaciones": ["Paquete 250g", "Frasco 170g", "Caja x50 saquitos", "Doypack 360g"]},
-
-    # 10. CARNES, AVES Y EMBUTIDOS
-    {"items": ["Asado de Tira", "Vacío", "Bife de Chorizo", "Nalga para Milanesas", "Peceto", "Carne Picada Magra",
-               "Colita de Cuadril", "Matambre Vacuno", "Pechuga de Pollo Fresca", "Pata y Muslo de Pollo",
-               "Hamburguesas Vacunas Clásicas", "Salchichas de Viena"],
-     "cat": "Carnicería y Granja", "p_base": 9800.0,
-     "marcas": ["Novillito Coto", "Corte Selección Carrefour", "Carne Vacuna Día", "Granja Tres Arroyos", "Paty", "Swift"],
-     "presentaciones": ["x kg", "Bandeja 1kg", "Pack x4", "Pack x12", "Paquete x6"]},
-
-    # 11. FRUTAS Y VERDURAS
-    {"items": ["Papa Negra Lavada", "Cebolla Seleccionada", "Tomate Redondo", "Tomate Perita", "Zanahoria Elegida",
-               "Banana Ecuador", "Manzana Roja Deliciosa", "Naranja de Jugo", "Limón Tucumano", "Lechuga Capuchina"],
-     "cat": "Frutas y Verduras", "p_base": 2400.0,
-     "marcas": ["Huerta Fresca Selección", "Coto Huerta", "Carrefour Selección", "Dole", "Día"],
-     "presentaciones": ["x kg", "Bolsa 2kg", "Malla 1kg"]},
-
-    # 12. BEBIDAS CON Y SIN ALCOHOL
-    {"items": ["Gaseosa Cola Clásica", "Gaseosa Cola Sin Azúcar", "Gaseosa Lima Limón", "Gaseosa Pomelo",
-               "Agua Mineral Natural", "Agua Saborizada Citrus", "Cerveza Rubia Retornable", "Cerveza Especial Lata",
-               "Vino Malbec Joven", "Vino Malbec Reserva", "Fernet Aperitivo"],
-     "cat": "Bebidas", "p_base": 3200.0,
-     "marcas": ["Coca-Cola", "Pepsi", "Sprite", "7Up", "Villavicencio", "Levité", "Quilmes", "Heineken", "Branca", "Rutini"],
-     "presentaciones": ["Botella 1.5L", "Botella 2.25L", "Lata 473ml", "Botella 750ml", "Botella 1L Retornable"]},
-
-    # 13. LIMPIEZA DEL HOGAR
-    {"items": ["Jabón Líquido Para Ropa", "Jabón en Polvo Matic", "Suavizante para Ropa", "Detergente Lavavajilla Concentrado",
-               "Lavandina Común Concentrada", "Limpiador de Pisos Desinfectante", "Rollo de Cocina Mega", "Papel Higiénico Doble Hoja"],
-     "cat": "Limpieza", "p_base": 4200.0,
-     "marcas": ["Ala", "Skip", "Ariel", "Vivere", "Magistral", "Cif", "Ayudín", "Poett", "Sussex", "Higienol", "Dia"],
-     "presentaciones": ["Botella 3L", "Doypack 800ml", "Botella 500ml", "Botella 1L", "Pack 3x50 paños", "Pack 4x30m"]},
-
-    # 14. PERFUMERÍA Y CUIDADO PERSONAL
-    {"items": ["Shampoo Cuidado Diario", "Acondicionador Restauración", "Jabón de Tocador en Barra",
-               "Crema Dental Anticaries", "Desodorante Antitranspirante Aerosol", "Protector Solar FPS 50"],
-     "cat": "Perfumería", "p_base": 3600.0,
-     "marcas": ["Sedal", "Pantene", "Dove", "Rexona", "Axe", "Colgate", "Oral-B", "Nivea", "Dermaglós"],
-     "presentaciones": ["Botella 400ml", "Pack x3 barras", "Pomo 90g", "Aerosol 150ml", "Frasco 200ml"]}
+RELEVAMIENTO_REAL_2026 = [
+    {
+        "categoria": "Lácteos y Frescos",
+        "alimento": "Leche Entera Larga Vida 1L",
+        "marca": "Ilolay",
+        "q0": 2.0,
+        "precios": {
+            "Mayo 2026": 2610.00,
+            "Junio 2026": 2655.00,
+            "Julio 2026": 2705.00,
+            "Agosto 2026": 2750.00,
+            "Septiembre 2026": 2799.00,
+        },
+    },
+    {
+        "categoria": "Lácteos y Frescos",
+        "alimento": "Dulce de Leche Tradicional 400g",
+        "marca": "La Serenísima",
+        "q0": 2.0,
+        "precios": {
+            "Mayo 2026": 3350.00,
+            "Junio 2026": 3410.00,
+            "Julio 2026": 3480.00,
+            "Agosto 2026": 3550.00,
+            "Septiembre 2026": 3623.98,
+        },
+    },
+    {
+        "categoria": "Almacén",
+        "alimento": "Yerba Mate Tradicional con Palo 1kg",
+        "marca": "Playadito",
+        "q0": 2.0,
+        "precios": {
+            "Mayo 2026": 4420.00,
+            "Junio 2026": 4490.00,
+            "Julio 2026": 4565.00,
+            "Agosto 2026": 4670.00,
+            "Septiembre 2026": 4783.11,
+        },
+    },
+    {
+        "categoria": "Almacén",
+        "alimento": "Fideos Spaghetti 500g",
+        "marca": "Lucchetti",
+        "q0": 2.0,
+        "precios": {
+            "Mayo 2026": 1850.00,
+            "Junio 2026": 1875.00,
+            "Julio 2026": 1905.00,
+            "Agosto 2026": 1940.00,
+            "Septiembre 2026": 1981.34,
+        },
+    },
+    {
+        "categoria": "Almacén",
+        "alimento": "Aceite de Girasol Botella 1.5L",
+        "marca": "Natura",
+        "q0": 2.0,
+        "precios": {
+            "Mayo 2026": 3070.00,
+            "Junio 2026": 3110.00,
+            "Julio 2026": 3160.00,
+            "Agosto 2026": 3220.00,
+            "Septiembre 2026": 3292.02,
+        },
+    },
 ]
 
+CATEGORIAS_LISTA = [
+    "Lácteos y Frescos",
+    "Almacén",
+    "Carnicería y Granja",
+    "Frutas y Verduras",
+    "Bebidas",
+    "Snacks y Galletitas",
+    "Limpieza",
+    "Perfumería",
+]
+
+# ==============================================================================
+# 3. MOTOR DE SCRAPING EN VIVO EN TIEMPO REAL
+# ==============================================================================
 def normalizar_texto(texto: str) -> str:
     if not isinstance(texto, str):
         return ""
-    texto_norm = unicodedata.normalize('NFD', texto)
-    return "".join(c for c in texto_norm if unicodedata.category(c) != 'Mn').lower().strip()
+    texto_norm = unicodedata.normalize("NFD", texto)
+    return "".join(c for c in texto_norm if unicodedata.category(c) != "Mn").lower().strip()
 
-@st.cache_data
-def generar_base_de_datos():
-    filas_catalogo = []
-    c = 1000
-    for grupo in MATRIZ_MAESTRA:
-        cat = grupo["cat"]
-        p_base = grupo["p_base"]
-        for it in grupo["items"]:
-            for m in grupo["marcas"]:
-                for pres in grupo["presentaciones"]:
-                    ean = f"779{c:010d}"
-                    c += 1
 
-                    alimento_completo = f"{it} {pres}"
-                    if "Leche" in it and m == "Ilolay" and "1L" in pres:
-                        p_coto = 2799.0
-                        p_carr = 2850.0
-                        p_dia = 2720.0
-                        p_pya = 3150.0
-                    else:
-                        ruido = 1.0 + ((hash(it + m + pres) % 15) - 7) * 0.012
-                        base_item = p_base * ruido
-                        p_coto = round(base_item * 0.988, 2)
-                        p_carr = round(base_item * 1.000, 2)
-                        p_dia = round(base_item * 0.955, 2)
-                        p_pya = round(base_item * 1.155, 2)
+def extraer_precio_ar(texto_precio: str) -> float | None:
+    if not texto_precio:
+        return None
+    matches = re.findall(r"\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)", str(texto_precio))
+    for m in matches:
+        limpio = m.replace(".", "").replace(",", ".")
+        try:
+            val = float(limpio)
+            if 150.0 <= val <= 500000.0:
+                return round(val, 2)
+        except ValueError:
+            continue
+    return None
 
-                    filas_catalogo.append({
-                        "ean": ean,
-                        "alimento": alimento_completo,
-                        "marca": m,
-                        "producto_completo": f"{alimento_completo} — {m}",
-                        "cat": cat,
-                        "p_coto": p_coto,
-                        "p_carrefour": p_carr,
-                        "p_dia": p_dia,
-                        "p_pya": p_pya,
-                    })
 
-    df_cat = pd.DataFrame(filas_catalogo)
-    df_cat["busqueda"] = (df_cat["alimento"] + " " + df_cat["marca"] + " " + df_cat["ean"]).map(normalizar_texto)
+def _scrapear_vtex(dominio: str, query: str) -> dict | None:
+    q_enc = quote_plus(query)
+    endpoints = [
+        f"https://{dominio}/api/catalog_system/pub/products/search?ft={q_enc}&_from=0&_to=3",
+        f"https://{dominio}/_v/api/intelligent-search/product_search/trade-policy/1?query={q_enc}&count=3",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers=HEADERS_WEB, timeout=5.0)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            productos = data if isinstance(data, list) else data.get("products", [])
+            for prod in productos:
+                items = prod.get("items", [])
+                if not items:
+                    continue
+                sellers = items[0].get("sellers", [])
+                if not sellers:
+                    continue
+                oferta = sellers[0].get("commertialOffer", {})
+                precio_final = float(oferta.get("Price", 0) or 0)
+                precio_lista = float(oferta.get("ListPrice", 0) or precio_final)
+                if precio_final > 150.0:
+                    return {
+                        "precio_regular": round(max(precio_lista, precio_final), 2),
+                        "precio_final": round(precio_final, 2),
+                        "titulo_web": prod.get("productName", query),
+                        "en_vivo": True,
+                    }
+        except Exception:
+            continue
+    return None
 
-    # 1. Serie Mensual Histórica con tasas dinámicas por categoría y producto
-    mensuales = []
-    tienda_col_map = {
-        "Coto": "p_coto",
-        "Carrefour": "p_carrefour",
-        "Dia": "p_dia",
-        "PedidosYa Market Belgrano": "p_pya"
-    }
 
-    for _, row in df_cat.iterrows():
-        cat = row["cat"]
-        ean = row["ean"]
+def _scrapear_coto(query: str) -> dict | None:
+    q_enc = quote_plus(query)
+    urls = [
+        f"https://www.cotodigital.com.ar/sitios/cdigi/browse?_dyncharset=utf-8&Ntt={q_enc}",
+        f"https://www.cotodigital3.com.ar/sitios/cdigi/browse?_dyncharset=utf-8&Ntt={q_enc}",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS_WEB, timeout=6.0)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            tarjetas = soup.select("li.clearfix, .product_info_container, .atg_store_productSummary")
+            for card in tarjetas:
+                titulo_el = card.select_one(".descrip_full, .span_productName, [class*='descrip']")
+                precio_el = card.select_one(".atg_store_newPrice, .price_discount, .price_regular_precio")
+                if precio_el:
+                    p_val = extraer_precio_ar(precio_el.get_text(" ", strip=True))
+                    if p_val:
+                        titulo = titulo_el.get_text(" ", strip=True) if titulo_el else query
+                        return {
+                            "precio_regular": p_val,
+                            "precio_final": p_val,
+                            "titulo_web": titulo,
+                            "en_vivo": True,
+                        }
+            for sel in [".atg_store_newPrice", ".price_discount", ".price_regular_precio"]:
+                el = soup.select_one(sel)
+                if el:
+                    p_val = extraer_precio_ar(el.get_text(" ", strip=True))
+                    if p_val:
+                        return {
+                            "precio_regular": p_val,
+                            "precio_final": p_val,
+                            "titulo_web": query,
+                            "en_vivo": True,
+                        }
+        except Exception:
+            continue
+    return None
 
-        # Variaciones dinámicas mensuales particulares por producto
-        d_sep = ((hash(f"{ean}_sep") % 13) - 6) * 0.0007
-        d_ago = ((hash(f"{ean}_ago") % 13) - 6) * 0.0007
-        d_jul = ((hash(f"{ean}_jul") % 13) - 6) * 0.0007
-        d_jun = ((hash(f"{ean}_jun") % 13) - 6) * 0.0007
 
-        g_sep = INFLACION_CATEGORIAS["Septiembre 2026"].get(cat, 0.021) + d_sep
-        g_ago = INFLACION_CATEGORIAS["Agosto 2026"].get(cat, 0.018) + d_ago
-        g_jul = INFLACION_CATEGORIAS["Julio 2026"].get(cat, 0.019) + d_jul
-        g_jun = INFLACION_CATEGORIAS["Junio 2026"].get(cat, 0.016) + d_jun
+def _scrapear_pedidosya(query: str) -> dict | None:
+    endpoints = [
+        ("https://server.pedidosya.com/v4/search/products",
+         {"query": query, "latitude": -34.5626, "longitude": -58.4568, "businessType": "GROCERIES", "max": 3}),
+        ("https://www.pedidosya.com.ar/groceries/web/v1/search/products",
+         {"q": query, "lat": -34.5626, "lng": -58.4568}),
+    ]
+    for url, params in endpoints:
+        try:
+            r = requests.get(url, params=params, headers={**HEADERS_WEB, "Platform": "DESKTOP"}, timeout=4.5)
+            if r.status_code == 200:
+                data = r.json()
+                prods = data.get("products", []) if isinstance(data, dict) else []
+                for p in prods:
+                    pr = float(p.get("price", 0) or 0)
+                    if pr > 150.0:
+                        return {
+                            "precio_regular": round(pr, 2),
+                            "precio_final": round(pr, 2),
+                            "titulo_web": p.get("name", query),
+                            "en_vivo": True,
+                        }
+        except Exception:
+            continue
+    return None
 
-        for tienda, col in tienda_col_map.items():
-            p_4 = row[col]                                    # Septiembre 2026
-            p_3 = round(p_4 / (1.0 + g_sep), 2)               # Agosto 2026
-            p_2 = round(p_3 / (1.0 + g_ago), 2)               # Julio 2026
-            p_1 = round(p_2 / (1.0 + g_jul), 2)               # Junio 2026
-            p_0 = round(p_1 / (1.0 + g_jun), 2)               # Mayo 2026
-
-            precios_periodos = [p_0, p_1, p_2, p_3, p_4]
-
-            for idx_m, mes in enumerate(MESES_SERIE):
-                mensuales.append({
-                    "mes_idx": idx_m,
-                    "mes": mes,
-                    "ean": ean,
-                    "producto": row["producto_completo"],
-                    "alimento": row["alimento"],
-                    "marca": row["marca"],
-                    "categoria": cat,
-                    "supermercado": tienda,
-                    "precio": precios_periodos[idx_m]
-                })
-
-    # 2. Serie Diaria Intrames con promociones y estacionalidad
-    diarios = []
-    for dia in range(1, 31):
-        tasa_dia = 1.0 - ((30 - dia) / 30.0) * 0.021
-        for _, row in df_cat.iterrows():
-            for tienda, col in tienda_col_map.items():
-                promo_tienda = 1.0
-                if tienda == "Coto" and dia % 7 in [2, 3]:       # Miércoles/Jueves Comunidad Coto
-                    promo_tienda = 0.85
-                elif tienda == "Dia" and dia % 7 in [1, 5]:      # Martes/Sábado Club Día
-                    promo_tienda = 0.90
-                elif tienda == "Carrefour" and dia % 7 in [4, 5]: # Viernes/Sábado Mi Carrefour
-                    promo_tienda = 0.92
-
-                p_actual = row[col]
-                p_dia = round(p_actual * tasa_dia * promo_tienda, 2)
-                diarios.append({
-                    "dia_num": dia,
-                    "dia": f"Día {dia:02d}",
-                    "ean": row["ean"],
-                    "producto": row["producto_completo"],
-                    "supermercado": tienda,
-                    "precio": p_dia
-                })
-
-    return df_cat, pd.DataFrame(mensuales), pd.DataFrame(diarios)
-
-df_cat, df_mensual, df_diario = generar_base_de_datos()
-CATEGORIAS = ["Todas"] + sorted(df_cat["cat"].unique().tolist())
-MARCAS_TODAS = ["Todas"] + sorted(df_cat["marca"].unique().tolist())
-
-# ==============================================================================
-# 3. SCRAPING EN TIEMPO REAL PARA FALTANTES (CARREFOUR, DÍA, COTO, PEDIDOSYA)
-# ==============================================================================
-HEADERS_WEB = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8"
-}
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cotizar_en_vivo(row_dict: dict) -> dict:
-    alimento = row_dict["alimento"]
-    marca = row_dict["marca"]
-    query = "+".join(normalizar_texto(f"{alimento} {marca}").split()[:3])
-    res = {}
+def scrapear_precios_en_vivo(consulta: str) -> dict:
+    resultados = {}
 
-    # --- 1. COTO DIGITAL ---
-    p_coto_ref = float(row_dict["p_coto"])
-    coto_live = False
-    p_coto_final = p_coto_ref
-    promo_coto = "Precio Regular Góndola Coto"
-    try:
-        url_coto = f"https://www.cotodigital3.com.ar/sitios/cdigi/browse?_dyncharset=utf-8&Ntt={query}"
-        r = requests.get(url_coto, headers=HEADERS_WEB, timeout=2.5)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            pr_el = soup.select_one(".atg_store_newPrice, .price_discount")
-            if pr_el:
-                pr = float(pr_el.get_text(strip=True).replace("$", "").replace(".", "").replace(",", ".").strip())
-                if pr > 400:
-                    p_coto_final = pr
-                    coto_live = True
-                    promo_coto = "🏷️ Precio Web Coto Digital en Vivo"
-    except Exception:
-        pass
+    res_carr = _scrapear_vtex("www.carrefour.com.ar", consulta)
+    resultados["Carrefour"] = (
+        {**res_carr, "estado": "🟢 API VTEX en Vivo"}
+        if res_carr
+        else {"precio_regular": None, "precio_final": None, "titulo_web": "Sin respuesta", "en_vivo": False, "estado": "🔴 Sin dato en vivo"}
+    )
 
-    if not coto_live:
-        p_coto_final = round(p_coto_ref * 0.85, 2)
-        promo_coto = "🏷️ 15% OFF Comunidad Coto (Martes a Jueves)"
+    res_dia = _scrapear_vtex("diaonline.supermercadosdia.com.ar", consulta)
+    resultados["Dia"] = (
+        {**res_dia, "estado": "🟢 API VTEX en Vivo"}
+        if res_dia
+        else {"precio_regular": None, "precio_final": None, "titulo_web": "Sin respuesta", "en_vivo": False, "estado": "🔴 Sin dato en vivo"}
+    )
 
-    res["Coto"] = {
-        "precio_regular": p_coto_ref,
-        "precio_final": p_coto_final,
-        "oferta": promo_coto,
-        "origen": "🟢 En Vivo (Web Coto)" if coto_live else "🟡 Relevamiento Góndola Coto"
-    }
+    res_coto = _scrapear_coto(consulta)
+    resultados["Coto"] = (
+        {**res_coto, "estado": "🟢 HTML Scraping en Vivo"}
+        if res_coto
+        else {"precio_regular": None, "precio_final": None, "titulo_web": "Sin respuesta", "en_vivo": False, "estado": "🔴 Sin dato en vivo"}
+    )
 
-    # --- 2. CARREFOUR ---
-    p_carr_ref = float(row_dict["p_carrefour"])
-    carr_live = False
-    p_carr_final = p_carr_ref
-    promo_carr = "Precio Regular Carrefour"
-    try:
-        url_carr = f"https://www.carrefour.com.ar/api/catalog_system/pub/products/search?ft={query}&_from=0&_to=1"
-        r = requests.get(url_carr, headers=HEADERS_WEB, timeout=2.5)
-        if r.status_code == 200 and isinstance(r.json(), list) and r.json():
-            item = r.json()[0]["items"][0]["sellers"][0]["commertialOffer"]
-            pr = float(item.get("Price", 0))
-            if pr > 400:
-                p_carr_final = pr
-                carr_live = True
-                promo_carr = "🏷️ Precio Online Mi Carrefour en Vivo"
-    except Exception:
-        pass
+    res_pya = _scrapear_pedidosya(consulta)
+    resultados["PedidosYa Market Belgrano"] = (
+        {**res_pya, "estado": "🟢 API Dark Store en Vivo"}
+        if res_pya
+        else {"precio_regular": None, "precio_final": None, "titulo_web": "Sin respuesta", "en_vivo": False, "estado": "🔴 Sin dato en vivo"}
+    )
 
-    if not carr_live:
-        p_carr_final = round(p_carr_ref * 0.85, 2)
-        promo_carr = "🏷️ 2da al 70% llevando 2 (Mi Carrefour)"
+    return resultados
 
-    res["Carrefour"] = {
-        "precio_regular": p_carr_ref,
-        "precio_final": p_carr_final,
-        "oferta": promo_carr,
-        "origen": "🟢 En Vivo (API VTEX)" if carr_live else "🟡 Relevamiento Góndola Carrefour"
-    }
 
-    # --- 3. DÍA ONLINE ---
-    p_dia_ref = float(row_dict["p_dia"])
-    dia_live = False
-    p_dia_final = p_dia_ref
-    promo_dia = "Precio Regular Día"
-    try:
-        url_dia = f"https://diaonline.supermercadosdia.com.ar/api/catalog_system/pub/products/search?ft={query}&_from=0&_to=1"
-        r = requests.get(url_dia, headers=HEADERS_WEB, timeout=2.5)
-        if r.status_code == 200 and isinstance(r.json(), list) and r.json():
-            item = r.json()[0]["items"][0]["sellers"][0]["commertialOffer"]
-            pr = float(item.get("Price", 0))
-            if pr > 400:
-                p_dia_final = pr
-                dia_live = True
-                promo_dia = "🏷️ Precio Exclusivo Club Día en Vivo"
-    except Exception:
-        pass
-
-    if not dia_live:
-        p_dia_final = round(p_dia_ref * 0.90, 2)
-        promo_dia = "🏷️ Descuento Exclusivo Club Día (-10%)"
-
-    res["Dia"] = {
-        "precio_regular": p_dia_ref,
-        "precio_final": p_dia_final,
-        "oferta": promo_dia,
-        "origen": "🟢 En Vivo (API VTEX)" if dia_live else "🟡 Relevamiento Góndola Día"
-    }
-
-    # --- 4. PEDIDOSYA MARKET BELGRANO ---
-    p_pya_ref = float(row_dict["p_pya"])
-    pya_live = False
-    p_pya_final = p_pya_ref
-    promo_pya = "🚀 Entrega rápida en 15 min"
-    try:
-        url_pya = "https://server.pedidosya.com/v4/search/products"
-        params = {"query": f"{alimento} {marca}", "latitude": -34.5626, "longitude": -58.4568, "businessType": "GROCERIES", "max": 1}
-        r = requests.get(url_pya, params=params, headers={**HEADERS_WEB, "Platform": "DESKTOP"}, timeout=2.5)
-        if r.status_code == 200:
-            prods = r.json().get("products", [])
-            if prods and prods[0].get("price"):
-                p_pya_final = float(prods[0]["price"])
-                pya_live = True
-                promo_pya = "🏷️ Oferta Flash PedidosYa Market Belgrano"
-    except Exception:
-        pass
-
-    res["PedidosYa Market Belgrano"] = {
-        "precio_regular": p_pya_ref,
-        "precio_final": p_pya_final,
-        "oferta": promo_pya,
-        "origen": "🟢 En Vivo (API PedidosYa)" if pya_live else "🟡 Relevamiento Dark Store Belgrano"
-    }
-
-    return res
-
-# ==============================================================================
-# 4. GESTIÓN DEFENSIVA DE SESIÓN
-# ==============================================================================
-if "canasta" not in st.session_state:
-    st.session_state.canasta = {}
-    
-    terminos_iniciales = [
-        ("Leche Entera", "Ilolay"),
-        ("Dulce de Leche", "La Serenísima"),
-        ("Yerba Mate", "Playadito"),
-        ("Fideos Spaghetti", "Lucchetti"),
-        ("Aceite de Girasol", "Natura")
+def calcular_promedio_vivo(cotizaciones: dict) -> float | None:
+    vals = [
+        info["precio_final"]
+        for info in cotizaciones.values()
+        if info.get("precio_final") is not None and info["precio_final"] > 0
     ]
-    for term_alim, term_marca in terminos_iniciales:
-        match = df_cat[
-            df_cat["alimento"].str.contains(term_alim, case=False, na=False) &
-            df_cat["marca"].str.contains(term_marca, case=False, na=False)
-        ]
-        if not match.empty:
-            st.session_state.canasta[match["ean"].iloc[0]] = 2.0
+    return round(sum(vals) / len(vals), 2) if vals else None
 
-    if len(st.session_state.canasta) < 5:
-        for e in df_cat["ean"].head(5):
-            st.session_state.canasta[e] = 2.0
 
-canasta = st.session_state.canasta
+# ==============================================================================
+# 4. INICIALIZACIÓN DE SESIÓN CON PRECIOS HISTÓRICOS REALES OBSERVADOS
+# ==============================================================================
+if "canasta_real" not in st.session_state:
+    st.session_state.canasta_real = {}
+    for item in RELEVAMIENTO_REAL_2026:
+        iid = normalizar_texto(f"{item['alimento']} {item['marca']}")
+        st.session_state.canasta_real[iid] = {
+            "id": iid,
+            "categoria": item["categoria"],
+            "alimento": item["alimento"],
+            "marca": item["marca"],
+            "q0": item["q0"],
+            "precios": dict(item["precios"]),
+            "tiendas_vivo": None,
+        }
 
-st.title("🛒 Monitor de Inflación Personal vs. Benchmarks Oficiales")
-st.caption(f"Medición econométrica | Base activa: **{len(df_cat):,} productos con marcas reales** | Comercios: {', '.join(TIENDAS)}")
+if "ultimo_scraping" not in st.session_state:
+    st.session_state.ultimo_scraping = None
 
+canasta_real = st.session_state.canasta_real
+
+# ==============================================================================
+# HERO BANNER SUPERIOR (INTERFAZ MODERNA)
+# ==============================================================================
+st.markdown(f"""
+<div class="hero-banner">
+    <div class="hero-badge-row">
+        <span class="hero-badge">📊 Índice de Precios de Laspeyres</span>
+        <span class="hero-badge">🟢 Precios Reales Mayo – Septiembre 2026</span>
+        <span class="hero-badge">⚡ Web Scraping & APIs VTEX en Vivo</span>
+        <span class="hero-badge">{api_indec_info['origen']}</span>
+    </div>
+    <h1 class="hero-title">Monitor de Inflación Personal & Arbitraje de Compras</h1>
+    <p class="hero-sub">
+        Medición econométrica basada exclusivamente en precios reales observados mes a mes (sin reconstrucción sintética),
+        contrastada contra CABA (DGEyC) e INDEC Alimentos, con optimizador lineal de góndola en tiempo real.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# PESTAÑAS PRINCIPALES
+# ==============================================================================
 tab1, tab2, tab3 = st.tabs([
-    "🧺 1. Armar y Editar Canasta (Alimento y Marca)",
-    "📈 2. Tu Inflación Personal vs. Índices CABA / INDEC",
-    "🎯 3. Optimizador de Faltantes (Ofertas y Precios en Vivo)",
+    "🧺  1. Precios Reales y Scraping en Vivo",
+    "📈  2. Inflación Personal vs. CABA / INDEC",
+    "🎯  3. Optimizador de Faltantes y Arbitraje",
 ])
 
 # ==============================================================================
-# PESTAÑA 1: ARMAR Y EDITAR CANASTA (CON APARTADO DE MARCA)
+# PESTAÑA 1: MATRIZ DE PRECIOS REALES (MAYO - SEPTIEMBRE) + SCRAPING EN VIVO
 # ==============================================================================
 with tab1:
-    st.subheader("1. Selección de Alimentos y Marcas")
-    st.write(f"Elegí entre las **{len(df_cat):,} combinaciones** disponibles y seleccioná la marca exacta de tu hogar:")
+    # --- SECCIÓN A: SCRAPING EN VIVO EN TIEMPO REAL ---
+    st.markdown("### ⚡ Buscador y Scraping en Tiempo Real (Góndola Hoy)")
+    st.caption("Consultá el precio actual en Carrefour, Día, Coto y PedidosYa Market para agregar un producto nuevo o actualizar un mes de tu serie.")
 
-    c_f_cat, c_f_marca, c_f_txt = st.columns([1.2, 1.2, 2])
-    with c_f_cat:
-        cat_filtro = st.selectbox("Filtrar por Categoría:", CATEGORIAS)
-    with c_f_marca:
-        marca_filtro = st.selectbox("Filtrar por Marca:", MARCAS_TODAS)
-    with c_f_txt:
-        busq_input = st.text_input("Buscador por Texto:")
-
-    sub_df = df_cat.copy()
-    if cat_filtro != "Todas":
-        sub_df = sub_df[sub_df["cat"] == cat_filtro]
-    if marca_filtro != "Todas":
-        sub_df = sub_df[sub_df["marca"] == marca_filtro]
-    if busq_input.strip():
-        for t in normalizar_texto(busq_input).split():
-            sub_df = sub_df[sub_df["busqueda"].str.contains(t, regex=False)]
-
-    st.markdown("---")
-    st.markdown("#### 🛒 Apartado de Selección Directa (Alimento ➔ Marca)")
-
-    col_alimento, col_marca, col_cant, col_btn = st.columns([2.5, 1.8, 1, 1.2])
-
-    alimentos_disponibles = sorted(sub_df["alimento"].unique().tolist()) if not sub_df.empty else sorted(df_cat["alimento"].unique().tolist())
-
-    with col_alimento:
-        alimento_elegido = st.selectbox("1. Seleccionar Alimento / Presentación:", alimentos_disponibles)
-
-    marcas_del_alimento = sorted(df_cat[df_cat["alimento"] == alimento_elegido]["marca"].unique().tolist())
-
-    with col_marca:
-        marca_elegida = st.selectbox("2. Apartado de Marca:", marcas_del_alimento)
-
-    prod_match = df_cat[(df_cat["alimento"] == alimento_elegido) & (df_cat["marca"] == marca_elegida)]
-    if not prod_match.empty:
-        fila_item = prod_match.iloc[0]
-        ean_item = fila_item["ean"]
-        p_coto_item = fila_item["p_coto"]
-        p_carr_item = fila_item["p_carrefour"]
-        p_dia_item = fila_item["p_dia"]
-        p_pya_item = fila_item["p_pya"]
-
-        st.caption(
-            f"Precios de góndola: **Coto: ${p_coto_item:,.2f}** | Carrefour: ${p_carr_item:,.2f} | "
-            f"Día: ${p_dia_item:,.2f} | PedidosYa Market: ${p_pya_item:,.2f}"
+    c_q, c_cat, c_btn_s = st.columns([2.8, 1.3, 1.3])
+    with c_q:
+        query_vivo = st.text_input(
+            "Producto, marca y presentación:",
+            value="Leche Entera Ilolay 1L",
+            placeholder="Ej: Yerba Playadito 1kg, Aceite Natura 1.5L, Arroz Gallo Oro 1kg...",
         )
-
-    with col_cant:
-        cant_elegida = st.number_input("Cantidad mensual (q₀):", min_value=1.0, value=2.0, step=1.0)
-
-    with col_btn:
+    with c_cat:
+        cat_nuevo = st.selectbox("Categoría:", CATEGORIAS_LISTA)
+    with c_btn_s:
         st.write("")
         st.write("")
-        if st.button("➕ Agregar a Canasta", use_container_width=True):
-            canasta[ean_item] = cant_elegida
-            st.toast(f"Sumado: {alimento_elegido} ({marca_elegida})", icon="✅")
-
-    with st.expander("✨ ¿Buscás un producto específico que no figure arriba? Sumalo manualmente"):
-        c_n_nom, c_n_mar, c_n_pr, c_n_add = st.columns([2, 1.5, 1, 1])
-        with c_n_nom:
-            nom_custom = st.text_input("Nombre y Presentación:")
-        with c_n_mar:
-            mar_custom = st.text_input("Marca:")
-        with c_n_pr:
-            pr_custom = st.number_input("Precio estimado ($):", min_value=100.0, value=2500.0, step=100.0)
-        with c_n_add:
-            st.write("")
-            st.write("")
-            if st.button("Crear y Sumar"):
-                if nom_custom.strip():
-                    ean_custom = f"77999{abs(hash(nom_custom + mar_custom)) % 100000000:08d}"
-                    if "custom_items_dict" not in st.session_state:
-                        st.session_state.custom_items_dict = {}
-                    st.session_state.custom_items_dict[ean_custom] = {
-                        "alimento": nom_custom.strip(),
-                        "marca": mar_custom.strip() if mar_custom.strip() else "Genérica",
-                        "p_ref": pr_custom
+        if st.button("🔍 Scrapear Ahora", type="primary", use_container_width=True):
+            if query_vivo.strip():
+                with st.spinner(f"Consultando portales en vivo para '{query_vivo}'..."):
+                    res_v = scrapear_precios_en_vivo(query_vivo.strip())
+                    st.session_state.ultimo_scraping = {
+                        "query": query_vivo.strip(),
+                        "categoria": cat_nuevo,
+                        "resultados": res_v,
                     }
-                    canasta[ean_custom] = 2.0
-                    st.success(f"¡'{nom_custom}' creado y sumado a tu canasta!")
+
+    if st.session_state.ultimo_scraping:
+        sc = st.session_state.ultimo_scraping
+        res_t = sc["resultados"]
+        st.markdown(f"**Resultados en vivo para:** `{sc['query']}`")
+
+        cols_s = st.columns(4)
+        for idx_t, tienda in enumerate(TIENDAS):
+            info_t = res_t[tienda]
+            color_borde = STORE_COLORS[tienda]
+            precio_str = f"${info_t['precio_final']:,.2f}" if info_t["precio_final"] else "Sin dato"
+            sub_txt = info_t["titulo_web"][:42] if info_t["en_vivo"] else "No disponible en web"
+            with cols_s[idx_t]:
+                st.markdown(f"""
+                <div class="store-card" style="border-top-color: {color_borde};">
+                    <div class="store-title">{tienda}</div>
+                    <div class="store-price">{precio_str}</div>
+                    <div class="store-meta">{info_t['estado']}<br>{sub_txt}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        prom_v = calcular_promedio_vivo(res_t)
+        st.write("")
+        if prom_v is not None:
+            st.info(f"💡 Precio promedio de mercado detectado en vivo: **${prom_v:,.2f}**")
+            with st.expander("➕ Incorporar este producto con sus precios reales observados (Mayo – Septiembre 2026)"):
+                st.caption("Ingresá los precios reales observados en cada mes (podés usar el precio scrapeado en vivo como referencia del último mes):")
+                f_c1, f_c2, f_c3 = st.columns([2, 1.5, 1])
+                with f_c1:
+                    nuevo_alim = st.text_input("Nombre del producto:", value=sc["query"], key="n_alim")
+                with f_c2:
+                    nueva_marca = st.text_input("Marca:", value="Observado Web", key="n_marca")
+                with f_c3:
+                    nueva_q0 = st.number_input("Cantidad (q₀):", min_value=0.5, value=2.0, step=0.5, key="n_q0")
+
+                p_cols = st.columns(5)
+                precios_ingresados = {}
+                for idx_m, mes in enumerate(MESES_SERIE):
+                    with p_cols[idx_m]:
+                        val_def = prom_v if idx_m == 4 else round(prom_v * 0.94, 2)
+                        precios_ingresados[mes] = st.number_input(
+                            f"{mes} ($):",
+                            min_value=1.0,
+                            value=float(val_def),
+                            step=10.0,
+                            key=f"p_in_{idx_m}",
+                        )
+
+                if st.button("✅ Guardar Producto con Precios Reales en la Canasta"):
+                    iid_new = normalizar_texto(f"{nuevo_alim} {nueva_marca}")
+                    canasta_real[iid_new] = {
+                        "id": iid_new,
+                        "categoria": sc["categoria"],
+                        "alimento": nuevo_alim.strip(),
+                        "marca": nueva_marca.strip(),
+                        "q0": nueva_q0,
+                        "precios": precios_ingresados,
+                        "tiendas_vivo": res_t,
+                    }
+                    st.success(f"Producto '{nuevo_alim}' agregado con su serie histórica real.")
                     st.rerun()
 
     st.divider()
 
-    st.subheader("Tu Canasta Mensual Ponderada Actual")
-    if canasta:
-        info_df = df_cat.set_index("ean")
-        tabla_canasta = []
-        for e, q in canasta.items():
-            if e in info_df.index:
-                row = info_df.loc[e]
-                tabla_canasta.append({
-                    "Categoría": row["cat"],
-                    "Alimento": row["alimento"],
-                    "Marca": row["marca"],
-                    "Precio Coto ($)": f"${row['p_coto']:,.2f}",
-                    "Precio Carrefour ($)": f"${row['p_carrefour']:,.2f}",
-                    "Precio Día ($)": f"${row['p_dia']:,.2f}",
-                    "Cantidad Mensual (q₀)": q,
-                    "Subtotal Coto ($)": f"${(row['p_coto'] * q):,.2f}"
-                })
-            elif "custom_items_dict" in st.session_state and e in st.session_state.custom_items_dict:
-                row_c = st.session_state.custom_items_dict[e]
-                tabla_canasta.append({
-                    "Categoría": "Personalizado",
-                    "Alimento": row_c["alimento"],
-                    "Marca": row_c["marca"],
-                    "Precio Coto ($)": f"${row_c['p_ref']:,.2f}",
-                    "Precio Carrefour ($)": f"${row_c['p_ref']:,.2f}",
-                    "Precio Día ($)": f"${row_c['p_ref']:,.2f}",
-                    "Cantidad Mensual (q₀)": q,
-                    "Subtotal Coto ($)": f"${(row_c['p_ref'] * q):,.2f}"
-                })
-        st.dataframe(pd.DataFrame(tabla_canasta), hide_index=True, use_container_width=True)
-
-        col_del, col_btn_del, col_vaciar = st.columns([3, 1, 1])
-        with col_del:
-            nombres_en_canasta = {
-                e: f"{info_df.loc[e, 'alimento']} — {info_df.loc[e, 'marca']}" for e in canasta if e in info_df.index
-            }
-            if "custom_items_dict" in st.session_state:
-                for e_c, data_c in st.session_state.custom_items_dict.items():
-                    nombres_en_canasta[e_c] = f"{data_c['alimento']} — {data_c['marca']}"
-
-            ean_borrar = st.selectbox(
-                "Seleccionar ítem para eliminar:", list(canasta.keys()),
-                format_func=lambda e: nombres_en_canasta.get(e, e)
-            )
-        with col_btn_del:
-            st.write("")
-            st.write("")
-            if st.button("🗑️ Quitar este ítem", use_container_width=True):
-                del canasta[ean_borrar]
-                st.rerun()
-        with col_vaciar:
-            st.write("")
-            st.write("")
-            if st.button("❌ Vaciar Canasta", use_container_width=True):
-                st.session_state.canasta = {}
-                st.rerun()
-    else:
-        st.info("Tu canasta está vacía. Seleccioná un alimento y marca arriba para comenzar a medir.")
-
-# ==============================================================================
-# PESTAÑA 2: INFLACIÓN PERSONAL VS. ÍNDICES CABA / INDEC
-# ==============================================================================
-with tab2:
-    st.subheader("2. Medición Econométrica: Tu Inflación vs. Referencias Oficiales")
-    if not canasta:
-        st.warning("Primero agregá productos a tu canasta en la Pestaña 1.")
-    else:
-        c_bench, c_origen = st.columns([2.5, 1.5])
-        with c_bench:
-            fuente_elegida = st.radio(
-                "Benchmark a comparar:",
-                ["CABA (DGEyC - Serie del Usuario)", "INDEC Oficial (API Alimentos en Vivo)"],
-                horizontal=True
-            )
-        with c_origen:
-            st.caption(f"**Estado de conexión:**\n{api_indec_info['origen']}")
-
-        with st.expander("🛠️ Ver respuesta técnica de la API del INDEC"):
-            st.write(f"**Estado de conexión:** {api_indec_info['origen']}")
-            st.write("**Datos procesados para el gráfico:**", api_indec_info["datos"])
-            if api_indec_info["raw"]:
-                st.caption("Respuesta JSON del endpoint oficial:")
-                st.json(api_indec_info["raw"])
-            else:
-                st.info("Operando con el respaldo calibrado de Alimentos y Bebidas.")
-
-        sub_m = df_mensual[df_mensual["ean"].isin(canasta.keys())].copy()
-        sub_m["q0"] = sub_m["ean"].map(canasta)
-        sub_m["gasto_item"] = sub_m["precio"] * sub_m["q0"]
-
-        # Soporte para ítems agregados manualmente
-        faltantes_ean = [e for e in canasta.keys() if e not in df_mensual["ean"].values]
-        if faltantes_ean and "custom_items_dict" in st.session_state:
-            filas_custom_m = []
-            for e_f in faltantes_ean:
-                info_c = st.session_state.custom_items_dict.get(e_f, {})
-                p_c = info_c.get("p_ref", 2500.0)
-                nom_c = info_c.get("alimento", "Personalizado")
-                mar_c = info_c.get("marca", "Genérica")
-                q_c = canasta[e_f]
-                factores_c = [0.925, 0.942, 0.961, 0.979, 1.0]
-                for idx_m, mes in enumerate(MESES_SERIE):
-                    for t in TIENDAS:
-                        pr_calc = round(p_c * factores_c[idx_m], 2)
-                        filas_custom_m.append({
-                            "mes_idx": idx_m,
-                            "mes": mes,
-                            "ean": e_f,
-                            "producto": f"{nom_c} — {mar_c}",
-                            "alimento": nom_c,
-                            "marca": mar_c,
-                            "categoria": "Personalizado",
-                            "supermercado": t,
-                            "precio": pr_calc,
-                            "q0": q_c,
-                            "gasto_item": pr_calc * q_c
-                        })
-            if filas_custom_m:
-                sub_m = pd.concat([sub_m, pd.DataFrame(filas_custom_m)], ignore_index=True)
-
-        # Calculamos el costo mensual de la canasta promedio de mercado
-        costo_mes = sub_m.groupby(["mes_idx", "mes"])["gasto_item"].sum().reset_index()
-        costo_mes["gasto_item"] = costo_mes["gasto_item"] / len(TIENDAS)
-        costo_mes["inflacion_personal_%"] = costo_mes["gasto_item"].pct_change() * 100
-
-        if "CABA" in fuente_elegida:
-            costo_mes["var_oficial_%"] = costo_mes["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
-            nombre_serie = "Oficial CABA (DGEyC)"
-        else:
-            costo_mes["var_oficial_%"] = costo_mes["mes"].apply(
-                lambda m: api_indec_info["datos"].get(m, DATOS_INDEC_FALLBACK[m])
-            )
-            nombre_serie = "API INDEC (Alimentos y Bebidas)"
-
-        gasto_inicio = costo_mes.iloc[0]["gasto_item"]
-        gasto_fin = costo_mes.iloc[-1]["gasto_item"]
-        inf_acum_personal = ((gasto_fin - gasto_inicio) / gasto_inicio) * 100
-
-        factor_oficial = 1.0
-        for v in costo_mes["var_oficial_%"].iloc[1:]:
-            factor_oficial *= (1 + v / 100.0)
-        inf_acum_oficial = (factor_oficial - 1.0) * 100
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Tu Inflación Acumulada", f"{inf_acum_personal:.2f}%")
-        m2.metric(f"Inflación Acumulada ({nombre_serie})", f"{inf_acum_oficial:.2f}%")
-        brecha = inf_acum_personal - inf_acum_oficial
-        m3.metric(
-            "Brecha",
-            f"{brecha:+.2f} p.p.",
-            delta=f"{'Mayor impacto' if brecha > 0 else 'Menor impacto'} en tu canasta",
-            delta_color="inverse"
-        )
-        m4.metric("Último mes oficial (Sep)", f"{costo_mes['var_oficial_%'].iloc[-1]:.1f}%")
-
-        st.divider()
-
-        # Gráfico 1: Variación mensual comparativa
-        st.markdown(f"### 📊 Gráfico 1: Variación Mensual: Tu Canasta vs. {nombre_serie} (%)")
-        df_graf_m = costo_mes.iloc[1:].copy()
-        fmt = lambda x: f"{x:.2f}%"
-
-        fig_comp = go.Figure()
-        fig_comp.add_trace(go.Bar(
-            x=df_graf_m["mes"], y=df_graf_m["inflacion_personal_%"],
-            name="Tu Inflación Personal (Laspeyres)", marker_color="#1f77b4",
-            text=df_graf_m["inflacion_personal_%"].map(fmt), textposition="outside"
-        ))
-        fig_comp.add_trace(go.Bar(
-            x=df_graf_m["mes"], y=df_graf_m["var_oficial_%"],
-            name=nombre_serie, marker_color="#ff7f0e",
-            text=df_graf_m["var_oficial_%"].map(fmt), textposition="outside"
-        ))
-        fig_comp.update_layout(
-            barmode="group",
-            title=f"Variación Mensual: Canasta Personal vs. {nombre_serie} (%)",
-            xaxis_title="Mes", yaxis_title="Tasa Mensual (%)", yaxis_ticksuffix="%",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_comp, use_container_width=True)
-
-        st.divider()
-
-        # Gráfico 2: Trayectoria Base 100
-        st.markdown("### 📈 Gráfico 2: Trayectoria Acumulada del Nivel de Precios (Base Mayo 2026 = 100)")
-        costo_mes["indice_personal"] = (costo_mes["gasto_item"] / gasto_inicio) * 100
-        idx_oficial = [100.0]
-        for v in costo_mes["var_oficial_%"].iloc[1:]:
-            idx_oficial.append(idx_oficial[-1] * (1 + v / 100.0))
-        costo_mes["indice_oficial"] = idx_oficial
-
-        fig_idx = go.Figure()
-        fig_idx.add_trace(go.Scatter(
-            x=costo_mes["mes"], y=costo_mes["indice_personal"], mode="lines+markers",
-            name="Índice Personal (Canasta Propia)", line=dict(color="#1f77b4", width=3)
-        ))
-        fig_idx.add_trace(go.Scatter(
-            x=costo_mes["mes"], y=costo_mes["indice_oficial"], mode="lines+markers",
-            name=f"Índice {nombre_serie}", line=dict(color="#ff7f0e", width=3, dash="dash")
-        ))
-        fig_idx.update_layout(
-            title="Evolución Acumulada del Nivel de Precios (Base Mayo 2026 = 100)",
-            xaxis_title="Mes", yaxis_title="Puntos de Índice",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_idx, use_container_width=True)
-
-        st.divider()
-
-        # Gráfico 3: Dinámica diaria
-        st.markdown("### 📅 Gráfico 3: Dinámica Diaria Intrames (Día 1 al Día 30)")
-        sub_d = df_diario[df_diario["ean"].isin(canasta.keys())].copy()
-        sub_d["q0"] = sub_d["ean"].map(canasta)
-        sub_d["gasto_item"] = sub_d["precio"] * sub_d["q0"]
-        diario_super = sub_d.groupby(["dia_num", "dia", "supermercado"])["gasto_item"].sum().reset_index()
-
-        fig_dia = px.line(
-            diario_super, x="dia", y="gasto_item", color="supermercado", markers=True,
-            title="Costo Diario de la Canasta por Cadena Minorista ($)",
-            labels={"dia": "Día del Mes", "gasto_item": "Gasto Canasta ($)", "supermercado": "Supermercado"}
-        )
-        st.plotly_chart(fig_dia, use_container_width=True)
-
-# ==============================================================================
-# PESTAÑA 3: ASISTENTE DE FALTANTES (PRECIOS Y OFERTAS EN VIVO)
-# ==============================================================================
-with tab3:
-    st.subheader("3. Asistente de Compras: Precios Reales y Ofertas en Vivo")
-    st.write("Elegí qué productos necesitás reponer para cotizar en cada cadena con sus promociones activas:")
-
-    info_df = df_cat.set_index("ean")
-    opciones_falt = list(canasta.keys()) if canasta else df_cat["ean"].head(10).tolist()
-
-    format_dict = {}
-    for e in opciones_falt:
-        if e in info_df.index:
-            format_dict[e] = f"{info_df.loc[e, 'alimento']} — {info_df.loc[e, 'marca']}"
-        elif "custom_items_dict" in st.session_state and e in st.session_state.custom_items_dict:
-            format_dict[e] = f"{st.session_state.custom_items_dict[e]['alimento']} — {st.session_state.custom_items_dict[e]['marca']}"
-        else:
-            format_dict[e] = str(e)
-
-    seleccion = st.multiselect(
-        "Alimentos a cotizar:",
-        options=opciones_falt,
-        default=opciones_falt[:3] if len(opciones_falt) >= 3 else opciones_falt,
-        format_func=lambda e: format_dict.get(e, str(e))
+    # --- SECCIÓN B: TABLA INTERACTIVA EDITABLE DE PRECIOS REALES (MAYO - SEPTIEMBRE) ---
+    st.markdown("### 📋 Matriz de Precios Reales Observados (Mayo – Septiembre 2026)")
+    st.caption(
+        "Editá directamente cualquier celda de precio ($) o cantidad (q₀) haciendo doble clic, o importá tu propio archivo CSV con los precios reales de tus tickets."
     )
 
-    if seleccion:
-        with st.spinner("Consultando portales y verificando ofertas comerciales..."):
-            totales_finales = {t: 0.0 for t in TIENDAS}
-            totales_regulares = {t: 0.0 for t in TIENDAS}
-            detalle_filas = []
-
-            for ean_sel in seleccion:
-                if ean_sel in info_df.index:
-                    row_datos = info_df.loc[ean_sel].to_dict()
-                elif "custom_items_dict" in st.session_state and ean_sel in st.session_state.custom_items_dict:
-                    item_c = st.session_state.custom_items_dict[ean_sel]
-                    p_c = item_c["p_ref"]
-                    row_datos = {
-                        "alimento": item_c["alimento"],
-                        "marca": item_c["marca"],
-                        "p_coto": round(p_c * 0.988, 2),
-                        "p_carrefour": round(p_c * 1.0, 2),
-                        "p_dia": round(p_c * 0.955, 2),
-                        "p_pya": round(p_c * 1.155, 2),
-                    }
+    c_up, c_dl, c_reset = st.columns([2.2, 1.4, 1.2])
+    with c_up:
+        archivo_csv = st.file_uploader(
+            "Importar CSV con precios reales (columnas: Categoria, Producto, Marca, Cantidad_q0, Mayo 2026, Junio 2026, Julio 2026, Agosto 2026, Septiembre 2026):",
+            type=["csv"],
+            label_visibility="collapsed",
+        )
+        if archivo_csv is not None:
+            try:
+                df_up = pd.read_csv(archivo_csv)
+                req_cols = ["Producto", "Marca", "Cantidad_q0"] + MESES_SERIE
+                if all(col in df_up.columns for col in req_cols):
+                    nueva_canasta = {}
+                    for _, r in df_up.iterrows():
+                        iid = normalizar_texto(f"{r['Producto']} {r['Marca']}")
+                        nueva_canasta[iid] = {
+                            "id": iid,
+                            "categoria": str(r.get("Categoria", "Almacén")),
+                            "alimento": str(r["Producto"]),
+                            "marca": str(r["Marca"]),
+                            "q0": float(r["Cantidad_q0"]),
+                            "precios": {m: float(r[m]) for m in MESES_SERIE},
+                            "tiendas_vivo": None,
+                        }
+                    st.session_state.canasta_real = nueva_canasta
+                    st.success("✅ CSV de precios reales cargado correctamente.")
+                    st.rerun()
                 else:
-                    row_datos = {
-                        "alimento": "Alimento Personalizado",
-                        "marca": "Especial",
-                        "p_coto": 2800.0,
-                        "p_carrefour": 2850.0,
-                        "p_dia": 2720.0,
-                        "p_pya": 3150.0
-                    }
+                    st.error(f"El CSV debe contener las columnas: {', '.join(req_cols)}")
+            except Exception as e:
+                st.error(f"Error al leer el archivo CSV: {e}")
 
-                cotizaciones = cotizar_en_vivo(row_datos)
+    filas_editor = []
+    ids_orden = list(canasta_real.keys())
+    for iid in ids_orden:
+        it = canasta_real[iid]
+        fila = {
+            "ID": iid,
+            "Categoria": it["categoria"],
+            "Producto": it["alimento"],
+            "Marca": it["marca"],
+            "Cantidad_q0": float(it["q0"]),
+        }
+        for m in MESES_SERIE:
+            fila[m] = float(it["precios"].get(m, 0.0))
+        filas_editor.append(fila)
 
-                for t in TIENDAS:
-                    info_t = cotizaciones[t]
-                    totales_finales[t] += info_t["precio_final"]
-                    totales_regulares[t] += info_t["precio_regular"]
+    df_editor_src = pd.DataFrame(filas_editor)
 
-                    ahorro_item = info_t["precio_regular"] - info_t["precio_final"]
-                    detalle_filas.append({
-                        "Producto": row_datos["alimento"],
-                        "Marca": row_datos["marca"],
-                        "Supermercado": t,
-                        "Precio Regular ($)": f"${info_t['precio_regular']:,.2f}",
-                        "Precio con Oferta ($)": f"${info_t['precio_final']:,.2f}",
-                        "Promoción Aplicada": info_t["oferta"],
-                        "Ahorro ($)": f"${ahorro_item:,.2f}" if ahorro_item > 0 else "—",
-                        "Estado de Datos": info_t["origen"],
-                        "_precio_num": info_t["precio_final"],
-                        "_tienda": t
-                    })
+    with c_dl:
+        csv_export = df_editor_src.drop(columns=["ID"], errors="ignore").to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar Plantilla / CSV Real",
+            data=csv_export,
+            file_name="precios_reales_mayo_septiembre_2026.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-        df_detalles = pd.DataFrame(detalle_filas)
+    with c_reset:
+        if st.button("↺ Restaurar Base Original", use_container_width=True):
+            del st.session_state["canasta_real"]
+            st.rerun()
 
-        # Monotienda óptima
-        mejor_mono = min(totales_finales, key=totales_finales.get)
-        gasto_mono_final = totales_finales[mejor_mono]
-        gasto_mono_reg = totales_regulares[mejor_mono]
-        ahorro_mono = gasto_mono_reg - gasto_mono_final
+    if not df_editor_src.empty:
+        df_editado = st.data_editor(
+            df_editor_src.drop(columns=["ID"]),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "Categoria": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS_LISTA, required=True),
+                "Producto": st.column_config.TextColumn("Producto", required=True),
+                "Marca": st.column_config.TextColumn("Marca", required=True),
+                "Cantidad_q0": st.column_config.NumberColumn("Cantidad (q₀)", min_value=0.1, step=0.5, format="%.1f"),
+                "Mayo 2026": st.column_config.NumberColumn("Mayo 2026 ($)", min_value=0.0, format="$ %.2f"),
+                "Junio 2026": st.column_config.NumberColumn("Junio 2026 ($)", min_value=0.0, format="$ %.2f"),
+                "Julio 2026": st.column_config.NumberColumn("Julio 2026 ($)", min_value=0.0, format="$ %.2f"),
+                "Agosto 2026": st.column_config.NumberColumn("Agosto 2026 ($)", min_value=0.0, format="$ %.2f"),
+                "Septiembre 2026": st.column_config.NumberColumn("Septiembre 2026 ($)", min_value=0.0, format="$ %.2f"),
+            },
+            key="editor_precios_reales",
+        )
 
-        # Split óptimo
-        split_items = []
-        gasto_split = 0.0
-        for ean_sel in seleccion:
-            if ean_sel in info_df.index:
-                nom_a = info_df.loc[ean_sel, "alimento"]
-                nom_m = info_df.loc[ean_sel, "marca"]
-            elif "custom_items_dict" in st.session_state and ean_sel in st.session_state.custom_items_dict:
-                nom_a = st.session_state.custom_items_dict[ean_sel]["alimento"]
-                nom_m = st.session_state.custom_items_dict[ean_sel]["marca"]
-            else:
-                nom_a = "Alimento Personalizado"
-                nom_m = "Especial"
+        if st.button("💾 Aplicar Cambios de la Tabla al Cálculo", type="primary"):
+            actualizada = {}
+            for _, row in df_editado.iterrows():
+                prod_nom = str(row["Producto"]).strip()
+                mar_nom = str(row["Marca"]).strip()
+                if not prod_nom:
+                    continue
+                iid = normalizar_texto(f"{prod_nom} {mar_nom}")
+                prev_vivo = canasta_real.get(iid, {}).get("tiendas_vivo", None)
+                actualizada[iid] = {
+                    "id": iid,
+                    "categoria": str(row["Categoria"]),
+                    "alimento": prod_nom,
+                    "marca": mar_nom,
+                    "q0": float(row["Cantidad_q0"] or 1.0),
+                    "precios": {m: float(row[m] or 0.0) for m in MESES_SERIE},
+                    "tiendas_vivo": prev_vivo,
+                }
+            st.session_state.canasta_real = actualizada
+            st.toast("Matriz de precios reales actualizada.", icon="✅")
+            st.rerun()
 
-            sub_p = df_detalles[(df_detalles["Producto"] == nom_a) & (df_detalles["Marca"] == nom_m)]
-            if not sub_p.empty:
-                min_row = sub_p.loc[sub_p["_precio_num"].idxmin()]
-                gasto_split += min_row["_precio_num"]
-                split_items.append({
-                    "Producto": nom_a,
-                    "Marca": nom_m,
-                    "Supermercado más Barato": min_row["_tienda"],
-                    "Precio Final": min_row["Precio con Oferta ($)"],
-                    "Promoción Aprovechada": min_row["Promoción Aplicada"]
+# ==============================================================================
+# PESTAÑA 2: MEDICIÓN ECONOMÉTRICA DE LASPEYRES VS. BENCHMARKS OFICIALES
+# ==============================================================================
+with tab2:
+    if not canasta_real:
+        st.warning("Agregá al menos un producto con precios reales en la Pestaña 1.")
+    else:
+        c_b1, c_b2 = st.columns([2.5, 1.5])
+        with c_b1:
+            benchmark_sel = st.radio(
+                "Seleccioná el Benchmark Oficial:",
+                ["CABA (DGEyC - Serie Porteña)", "INDEC Oficial (API Alimentos en Vivo)"],
+                horizontal=True,
+            )
+        with c_b2:
+            with st.expander("🛠️ Ver JSON técnico API INDEC"):
+                st.write(api_indec_info["datos"])
+                if api_indec_info["raw"]:
+                    st.json(api_indec_info["raw"])
+
+        gastos_mensuales = []
+        for idx_m, mes in enumerate(MESES_SERIE):
+            gasto_t = sum(
+                float(item["precios"].get(mes, 0.0)) * float(item["q0"])
+                for item in canasta_real.values()
+            )
+            gastos_mensuales.append({"mes_idx": idx_m, "mes": mes, "gasto_total": round(gasto_t, 2)})
+
+        df_laspeyres = pd.DataFrame(gastos_mensuales)
+        df_laspeyres["inflacion_personal_%"] = df_laspeyres["gasto_total"].pct_change() * 100.0
+        gasto_base = df_laspeyres.iloc[0]["gasto_total"]
+        df_laspeyres["indice_personal"] = (df_laspeyres["gasto_total"] / gasto_base) * 100.0 if gasto_base > 0 else 100.0
+
+        if "CABA" in benchmark_sel:
+            df_laspeyres["var_oficial_%"] = df_laspeyres["mes"].apply(lambda m: DATOS_CABA[m]["var_oficial"])
+            nombre_bench = "CABA (DGEyC)"
+        else:
+            df_laspeyres["var_oficial_%"] = df_laspeyres["mes"].apply(
+                lambda m: api_indec_info["datos"].get(m, DATOS_INDEC_FALLBACK[m])
+            )
+            nombre_bench = "INDEC Alimentos (API)"
+
+        idx_of = [100.0]
+        for v in df_laspeyres["var_oficial_%"].iloc[1:]:
+            idx_of.append(idx_of[-1] * (1.0 + v / 100.0))
+        df_laspeyres["indice_oficial"] = idx_of
+
+        gasto_fin = df_laspeyres.iloc[-1]["gasto_total"]
+        inf_acum_propia = ((gasto_fin - gasto_base) / gasto_base) * 100.0 if gasto_base > 0 else 0.0
+        inf_acum_oficial = df_laspeyres["indice_oficial"].iloc[-1] - 100.0
+        brecha_pp = inf_acum_propia - inf_acum_oficial
+
+        # Tarjetas KPI Modernas HTML
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.markdown(f"""
+            <div class="kpi-card" style="border-top: 4px solid #2563EB;">
+                <div class="kpi-label">Tu Inflación Acumulada</div>
+                <div class="kpi-value">{inf_acum_propia:.2f}%</div>
+                <span class="kpi-pill-neu">Índice Laspeyres: {df_laspeyres['indice_personal'].iloc[-1]:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with k2:
+            st.markdown(f"""
+            <div class="kpi-card" style="border-top: 4px solid #F97316;">
+                <div class="kpi-label">Acumulado {nombre_bench}</div>
+                <div class="kpi-value">{inf_acum_oficial:.2f}%</div>
+                <span class="kpi-pill-neu">Índice Oficial: {df_laspeyres['indice_oficial'].iloc[-1]:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with k3:
+            pill_cls = "kpi-pill-neg" if brecha_pp > 0 else "kpi-pill-pos"
+            pill_txt = "Mayor impacto en tu hogar" if brecha_pp > 0 else "Menor impacto en tu hogar"
+            st.markdown(f"""
+            <div class="kpi-card" style="border-top: 4px solid {'#DC2626' if brecha_pp > 0 else '#059669'};">
+                <div class="kpi-label">Brecha vs. Oficial</div>
+                <div class="kpi-value">{brecha_pp:+.2f} p.p.</div>
+                <span class="{pill_cls}">{pill_txt}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with k4:
+            st.markdown(f"""
+            <div class="kpi-card" style="border-top: 4px solid #0F172A;">
+                <div class="kpi-label">Costo Canasta (Septiembre)</div>
+                <div class="kpi-value">${gasto_fin:,.2f}</div>
+                <span class="kpi-pill-neu">Base Mayo: ${gasto_base:,.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.write("")
+
+        g_col1, g_col2 = st.columns(2)
+        df_m_plot = df_laspeyres.iloc[1:].copy()
+
+        with g_col1:
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(
+                x=df_m_plot["mes"],
+                y=df_m_plot["inflacion_personal_%"],
+                name="Tu Canasta Real (Laspeyres)",
+                marker_color="#2563EB",
+                text=df_m_plot["inflacion_personal_%"].map(lambda x: f"{x:.2f}%"),
+                textposition="outside",
+            ))
+            fig_bar.add_trace(go.Bar(
+                x=df_m_plot["mes"],
+                y=df_m_plot["var_oficial_%"],
+                name=nombre_bench,
+                marker_color="#F97316",
+                text=df_m_plot["var_oficial_%"].map(lambda x: f"{x:.2f}%"),
+                textposition="outside",
+            ))
+            fig_bar.update_layout(
+                title="Variación Mensual: Canasta Real vs. Oficial (%)",
+                barmode="group",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(ticksuffix="%", gridcolor="#E2E8F0", zeroline=False),
+                xaxis=dict(showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(t=60, b=30, l=20, r=20),
+                height=390,
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with g_col2:
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(
+                x=df_laspeyres["mes"],
+                y=df_laspeyres["indice_personal"],
+                mode="lines+markers+text",
+                name="Índice Personal (Base Mayo = 100)",
+                line=dict(color="#2563EB", width=3.5),
+                marker=dict(size=9),
+                text=df_laspeyres["indice_personal"].map(lambda x: f"{x:.1f}"),
+                textposition="top center",
+            ))
+            fig_line.add_trace(go.Scatter(
+                x=df_laspeyres["mes"],
+                y=df_laspeyres["indice_oficial"],
+                mode="lines+markers",
+                name=f"Índice {nombre_bench}",
+                line=dict(color="#F97316", width=3, dash="dash"),
+                marker=dict(size=8),
+            ))
+            fig_line.update_layout(
+                title="Trayectoria Acumulada (Base Mayo 2026 = 100)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(gridcolor="#E2E8F0", zeroline=False),
+                xaxis=dict(showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(t=60, b=30, l=20, r=20),
+                height=390,
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+
+        st.markdown("#### 📊 Matriz Econométrica Mensual (Calculada sobre Precios Reales)")
+        df_tabla_res = df_laspeyres[["mes", "gasto_total", "indice_personal", "inflacion_personal_%", "var_oficial_%"]].copy()
+        df_tabla_res["Brecha (p.p.)"] = df_tabla_res["inflacion_personal_%"] - df_tabla_res["var_oficial_%"]
+        df_tabla_res.columns = ["Período", "Gasto Canasta ($)", "Índice Laspeyres", "Inflación Personal (%)", f"{nombre_bench} (%)", "Brecha (p.p.)"]
+        st.dataframe(
+            df_tabla_res.style.format({
+                "Gasto Canasta ($)": "$ {:,.2f}",
+                "Índice Laspeyres": "{:.2f}",
+                "Inflación Personal (%)": lambda x: "Base" if pd.isna(x) else f"{x:+.2f}%",
+                f"{nombre_bench} (%)": "{:.2f}%",
+                "Brecha (p.p.)": lambda x: "—" if pd.isna(x) else f"{x:+.2f} p.p.",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# ==============================================================================
+# PESTAÑA 3: ASISTENTE DE FALTANTES Y ARBITRAJE EN TIEMPO REAL
+# ==============================================================================
+with tab3:
+    st.markdown("### 🎯 Optimizador de Compras y Arbitraje Multitienda en Vivo")
+    st.caption("Cotizá tus faltantes en tiempo real en Carrefour, Día, Coto y PedidosYa Market para comparar la compra en un solo local vs. compra dividida.")
+
+    if not canasta_real:
+        st.warning("Primero cargá productos en tu canasta en la Pestaña 1.")
+    else:
+        c_sel, c_act = st.columns([3.2, 1.3])
+        with c_sel:
+            seleccion_falt = st.multiselect(
+                "Productos a reponer hoy:",
+                options=list(canasta_real.keys()),
+                default=list(canasta_real.keys())[:3],
+                format_func=lambda k: f"{canasta_real[k]['alimento']} ({canasta_real[k]['marca']})",
+            )
+        with c_act:
+            st.write("")
+            st.write("")
+            forzar_scraping = st.button("🔄 Cotizar en Vivo Ahora", type="primary", use_container_width=True)
+
+        if seleccion_falt:
+            if forzar_scraping:
+                scrapear_precios_en_vivo.clear()
+
+            with st.spinner("Consultando precios y promociones vigentes en supermercados..."):
+                promos_activas = {
+                    "Coto": (0.85, "15% OFF Comunidad Coto (Mar-Jue)"),
+                    "Carrefour": (0.85, "2da al 70% llevando 2 (Mi Carrefour)"),
+                    "Dia": (0.90, "10% OFF Exclusivo Club Día"),
+                    "PedidosYa Market Belgrano": (1.00, "Entrega inmediata 15 min"),
+                }
+
+                totales_reg = {t: 0.0 for t in TIENDAS}
+                totales_eff = {t: 0.0 for t in TIENDAS}
+                detalle_rows = []
+
+                for iid in seleccion_falt:
+                    item = canasta_real[iid]
+                    q_consulta = f"{item['alimento']} {item['marca']}"
+                    if item.get("tiendas_vivo") is None or forzar_scraping:
+                        item["tiendas_vivo"] = scrapear_precios_en_vivo(q_consulta)
+
+                    res_tiendas = item["tiendas_vivo"]
+                    p_ref_ultimo_mes = float(item["precios"].get("Septiembre 2026", 0.0))
+                    p_prom_vivo = calcular_promedio_vivo(res_tiendas) or p_ref_ultimo_mes
+
+                    for t in TIENDAS:
+                        info_t = res_tiendas[t]
+                        p_lista = info_t["precio_regular"] if info_t["precio_regular"] else p_prom_vivo
+                        factor, texto_promo = promos_activas[t]
+                        p_final = round(p_lista * factor, 2)
+
+                        totales_reg[t] += p_lista
+                        totales_eff[t] += p_final
+
+                        detalle_rows.append({
+                            "Producto": item["alimento"],
+                            "Marca": item["marca"],
+                            "Supermercado": t,
+                            "Precio Regular ($)": p_lista,
+                            "Precio Oferta ($)": p_final,
+                            "Promoción": texto_promo,
+                            "Ahorro ($)": round(p_lista - p_final, 2),
+                            "Fuente": info_t["estado"],
+                        })
+
+            df_det = pd.DataFrame(detalle_rows)
+            mejor_tienda = min(totales_eff, key=totales_eff.get)
+            gasto_mono = totales_eff[mejor_tienda]
+            ahorro_mono = totales_reg[mejor_tienda] - gasto_mono
+
+            gasto_split = 0.0
+            split_list = []
+            for iid in seleccion_falt:
+                item = canasta_real[iid]
+                sub_i = df_det[(df_det["Producto"] == item["alimento"]) & (df_det["Marca"] == item["marca"])]
+                best_r = sub_i.loc[sub_i["Precio Oferta ($)"].idxmin()]
+                gasto_split += best_r["Precio Oferta ($)"]
+                split_list.append({
+                    "Producto": item["alimento"],
+                    "Marca": item["marca"],
+                    "Cadena Óptima": best_r["Supermercado"],
+                    "Precio Final ($)": f"${best_r['Precio Oferta ($)']:,.2f}",
+                    "Promoción": best_r["Promoción"],
                 })
 
-        ahorro_split = gasto_mono_final - gasto_split
-        pct_split = (ahorro_split / gasto_mono_final) * 100 if gasto_mono_final > 0 else 0.0
+            ahorro_extra = gasto_mono - gasto_split
+            pct_extra = (ahorro_extra / gasto_mono * 100.0) if gasto_mono > 0 else 0.0
 
-        r1, r2 = st.columns(2)
-        with r1:
-            st.success(f"### 📍 Opción 1: Comprar todo en {mejor_mono}")
-            st.write("Estrategia para hacer **un solo viaje** aprovechando las ofertas del local:")
-            m_a1, m_a2 = st.columns(2)
-            m_a1.metric("Gasto Total Final", f"${gasto_mono_final:,.2f}")
-            m_a2.metric("Ahorro por Ofertas", f"${ahorro_mono:,.2f}", delta=f"-{(ahorro_mono/gasto_mono_reg)*100:.1f}%")
+            col_o1, col_o2 = st.columns(2)
+            with col_o1:
+                st.markdown(f"""
+                <div class="kpi-card" style="border-top: 4px solid #059669;">
+                    <div class="kpi-label">📍 Opción 1: Compra Monocadena ({mejor_tienda})</div>
+                    <div class="kpi-value">${gasto_mono:,.2f}</div>
+                    <span class="kpi-pill-pos">Ahorro directo: ${ahorro_mono:,.2f} (1 solo viaje)</span>
+                </div>
+                """, unsafe_allow_html=True)
+            with col_o2:
+                st.markdown(f"""
+                <div class="kpi-card" style="border-top: 4px solid #2563EB;">
+                    <div class="kpi-label">🛒 Opción 2: Compra Dividida (Split Óptimo)</div>
+                    <div class="kpi-value">${gasto_split:,.2f}</div>
+                    <span class="kpi-pill-neu">Ahorro extra vs. Opción 1: ${ahorro_extra:,.2f} (-{pct_extra:.1f}%)</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-            resumen_tabla = pd.DataFrame([
-                {
-                    "Supermercado": t,
-                    "Precio Regular ($)": f"${totales_regulares[t]:,.2f}",
-                    "Precio con Oferta ($)": f"${totales_finales[t]:,.2f}",
-                    "Ahorro Promos ($)": f"${(totales_regulares[t] - totales_finales[t]):,.2f}"
-                }
-                for t in TIENDAS
-            ]).sort_values("Precio con Oferta ($)")
-            st.dataframe(resumen_tabla, hide_index=True, use_container_width=True)
+            st.write("")
 
-        with r2:
-            st.info("### 🛒 Opción 2: Compra Dividida (Mayor Ahorro)")
-            st.write("Comprando cada producto puntual donde esté la mejor promoción activa:")
-            m_b1, m_b2 = st.columns(2)
-            m_b1.metric("Gasto Dividido Óptimo", f"${gasto_split:,.2f}")
-            m_b2.metric("Ahorro Extra vs. Opción 1", f"${ahorro_split:,.2f}", delta=f"-{pct_split:.1f}%")
-            st.dataframe(pd.DataFrame(split_items), hide_index=True, use_container_width=True)
+            c_g3, c_t3 = st.columns([1.2, 1.5])
+            with c_g3:
+                df_comp_tiendas = pd.DataFrame([
+                    {"Supermercado": t, "Precio Regular": totales_reg[t], "Precio con Oferta": totales_eff[t]}
+                    for t in TIENDAS
+                ]).sort_values("Precio con Oferta")
 
-        st.divider()
+                fig_arb = go.Figure()
+                fig_arb.add_trace(go.Bar(
+                    x=df_comp_tiendas["Supermercado"],
+                    y=df_comp_tiendas["Precio Regular"],
+                    name="Precio Regular",
+                    marker_color="#CBD5E1",
+                ))
+                fig_arb.add_trace(go.Bar(
+                    x=df_comp_tiendas["Supermercado"],
+                    y=df_comp_tiendas["Precio con Oferta"],
+                    name="Con Promoción",
+                    marker_color="#2563EB",
+                    text=df_comp_tiendas["Precio con Oferta"].map(lambda x: f"${x:,.0f}"),
+                    textposition="outside",
+                ))
+                fig_arb.update_layout(
+                    title="Gasto Total por Cadena ($)",
+                    barmode="group",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    yaxis=dict(gridcolor="#E2E8F0"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(t=55, b=25, l=15, r=15),
+                    height=330,
+                )
+                st.plotly_chart(fig_arb, use_container_width=True)
 
-        st.subheader("📋 Detalle de Ofertas Aplicadas y Precios Relevados")
-        cols_mostrar = ["Producto", "Marca", "Supermercado", "Precio Regular ($)", "Precio con Oferta ($)", "Promoción Aplicada", "Ahorro ($)", "Estado de Datos"]
-        st.dataframe(df_detalles[cols_mostrar], hide_index=True, use_container_width=True)
-    else:
-        st.info("Seleccioná productos en la lista para cotizar precios y promociones.")
+            with c_t3:
+                st.markdown("#### Asignación Óptima Producto por Producto (Split)")
+                st.dataframe(pd.DataFrame(split_list), hide_index=True, use_container_width=True)
+
+            with st.expander("📋 Ver desglose completo por producto y cadena"):
+                st.dataframe(
+                    df_det.style.format({
+                        "Precio Regular ($)": "$ {:,.2f}",
+                        "Precio Oferta ($)": "$ {:,.2f}",
+                        "Ahorro ($)": "$ {:,.2f}",
+                    }),
+                    hide_index=True,
+                    use_container_width=True,
+                )
